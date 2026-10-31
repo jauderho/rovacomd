@@ -1,0 +1,72 @@
+diff --git a/src/host/usb-linux.c b/src/host/usb-linux.c
+index 8423d1c..21a7feb 100644
+--- a/src/host/usb-linux.c
++++ b/src/host/usb-linux.c
+@@ -33,7 +33,9 @@
+ #include <log.h>
+ #include <sys/queue.h>
+ 
++#ifdef __linux__
+ #include <linux/usbdevice_fs.h>
++#endif
+ #include "../novacom/mux.h"
+ #include "device_list.h"
+ 
+@@ -267,10 +269,13 @@ static int novacom_usb_close(novacom_usb_handle_t *usb_handle)
+ 
+ int novacom_usb_transport_init(void)
+ {
++#ifdef __linux__
++	/* usbdevfs nodes are root-only on Linux; libusb on macOS needs no root. */
+ 	if (geteuid() != 0) {
+ 		log_printf(LOG_ERROR, "need to run as super user to access usb\n");
+ 		return -1;
+ 	}
++#endif
+ 
+ 	usb_init();
+ 	return 0;
+@@ -283,6 +288,8 @@ static int novacom_usb_read(novacom_usb_handle_t *handle, void *buf, size_t len)
+ //	TRACEF("handle %p, buf %p, len %d, timeout %d\n", handle, buf, len, timeout);
+ //	TRACEF("fd %d\n", handle->myhandle->fd);
+ 
++	int rc;
++#ifdef __linux__
+ 	struct usbdevfs_bulktransfer bulktransfer;
+ 
+ 	bulktransfer.ep = handle->rxep;
+@@ -290,8 +297,11 @@ static int novacom_usb_read(novacom_usb_handle_t *handle, void *buf, size_t len)
+ 	bulktransfer.timeout = handle->rx_timeout;
+ 	bulktransfer.data = buf;
+ 
+-	int rc;
+ 	rc = ioctl(handle->myhandle->fd, USBDEVFS_BULK, &bulktransfer);
++#else
++	/* rovacom build patch (macOS): libusb bulk read instead of usbdevfs. */
++	rc = usb_bulk_read(handle->handle, handle->rxep, (char *)buf, (int)len, handle->rx_timeout);
++#endif
+ 	if (rc > 0) { //now check the packet header
+ 
+ 		if (novacom_usbll_check_packet_header(buf, rc)) { //bad packet
+@@ -308,6 +318,8 @@ static int novacom_usb_write(novacom_usb_handle_t *handle, const void *buf, size
+ //	TRACEF("handle %p, buf %p, len %d, timeout %d\n", handle, buf, len, timeout);
+ //	TRACEF("fd %d\n", handle->myhandle->fd);
+ 
++	int rc;
++#ifdef __linux__
+ 	struct usbdevfs_bulktransfer bulktransfer;
+ 
+ 	bulktransfer.ep = handle->txep;
+@@ -315,8 +327,11 @@ static int novacom_usb_write(novacom_usb_handle_t *handle, const void *buf, size
+ 	bulktransfer.timeout = handle->tx_timeout;
+ 	bulktransfer.data = (void *)buf;
+ 
+-	int rc;
+ 	rc = ioctl(handle->myhandle->fd, USBDEVFS_BULK, &bulktransfer);
++#else
++	/* rovacom build patch (macOS): libusb bulk write instead of usbdevfs. */
++	rc = usb_bulk_write(handle->handle, handle->txep, (const char *)buf, (int)len, handle->tx_timeout);
++#endif
+ //	TRACEF("rc %d\n", rc);
+ 	return rc;
+ }

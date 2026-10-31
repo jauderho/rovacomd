@@ -1,0 +1,17 @@
+diff --git a/src/host/usb-linux.c b/src/host/usb-linux.c
+index 21a7feb..f0ab487 100644
+--- a/src/host/usb-linux.c
++++ b/src/host/usb-linux.c
+@@ -269,8 +269,10 @@ static int novacom_usb_close(novacom_usb_handle_t *usb_handle)
+ 
+ int novacom_usb_transport_init(void)
+ {
+-#ifdef __linux__
+-	/* usbdevfs nodes are root-only on Linux; libusb on macOS needs no root. */
++#if defined(__linux__) && !defined(REFERENCE_NO_ROOT_CHECK)
++	/* usbdevfs nodes are root-only on Linux; libusb on macOS needs no root.
++	 * REFERENCE_NO_ROOT_CHECK (rovacomd test builds only): skip the check so
++	 * the TCP side can be tested without root. */
+ 	if (geteuid() != 0) {
+ 		log_printf(LOG_ERROR, "need to run as super user to access usb\n");
+ 		return -1;
