@@ -629,7 +629,17 @@ fn linux_rcvlowat_stall() {
         let mut s = FakeDevice::connect_raw();
         FakeDevice::read_host_syn(&mut s);
         s.write_all(&syn(A)).expect("send syn");
-        std::thread::sleep(Duration::from_secs(1));
+        // rovacomd: wait until it registers (a fixed sleep failed under load).
+        // C: it never registers; 1 s shows that it did not.
+        let wait = if want == 0 {
+            Duration::from_secs(1)
+        } else {
+            TIMEOUT
+        };
+        let deadline = Instant::now() + wait;
+        while lines(&devlist()) != want && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
         assert_eq!(lines(&devlist()), want, "{}", bin.path.display());
         drop(s);
         drop(d);
