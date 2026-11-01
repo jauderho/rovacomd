@@ -16,4 +16,5 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2.191"
+nusb = "0.2.9"
 sha1 = { version = "0.11.0", default-features = false }

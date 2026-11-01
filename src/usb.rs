@@ -3,8 +3,9 @@
 //! retries, recovery hand-over) and the daemon's [`Host`] for the link
 //! layer.
 //!
-//! Enumeration, claiming and bulk transfers (libusb / usbdevfs) come with
-//! the platform backends in slice 5; here a device is a [`UsbLink`].
+//! Discovery and the find-and-attach thread are in [`scan`]; enumeration,
+//! claiming and bulk transfers through `nusb` in [`backend`]; a claimed
+//! device is a [`UsbLink`].
 //!
 //! Per device, as in C: the rx thread reads (first with the 5000 ms
 //! default timeout), and its first packet decides between resuming a
@@ -34,11 +35,13 @@ use crate::usbll::{
 };
 use crate::{inet, log, server, sys};
 
+pub mod backend;
+pub mod scan;
+
 /// C `USBDEVFS_IOCTL_TIMEOUT`: link timeout of a new link (ms).
 pub const USBDEVFS_IOCTL_TIMEOUT: i32 = 2000;
 
-/// The bulk endpoints of a claimed device (slice 5 implements this per
-/// platform).
+/// The bulk endpoints of a claimed device ([`backend::NusbLink`]).
 pub trait UsbLink: Send + Sync {
     /// One bulk IN transfer into `buf` (C `USBDEVFS_BULK` /
     /// `usb_bulk_read`); only the bytes read are written.
@@ -481,6 +484,27 @@ pub fn tx_loop<K: UsbLink, H: Host>(h: &UsbHandle<K, H::Dev>, host: &H, s: Setti
         }
     }
     h.tx_ended();
+}
+
+/// C `novacom_usb_transport_start`: the find-and-attach thread, scanning
+/// once a second for ever. The `-t`, `-e` and `-s` values are read at each
+/// attach (C reads the globals, which the option port can change).
+///
+/// Intentional change: C `novacom_usb_transport_init` (Linux) exits with
+/// `need to run as super user to access usb` when not root; there is no
+/// such check here (devices that cannot be opened are reported by
+/// [`scan::Scanner`]).
+pub fn start(tokens: TokenStore) {
+    let host = Arc::new(Daemon::new(tokens));
+    let _ = inet::spawn(move || {
+        let mut scanner = scan::Scanner::new(backend::Nusb);
+        loop {
+            scanner.pass(&*host, |o| {
+                let h = Arc::new(UsbHandle::new(o.link, o.devtype, o.busnum, o.devnum));
+                attach(h, Arc::clone(&host), Settings::from_options()).into()
+            });
+        }
+    });
 }
 
 /// The daemon's link-layer environment: wall clock, `rand()`, the host

@@ -237,7 +237,9 @@ pub fn main_entry() -> ! {
         opt: bind_or_exit(net::OPTPORT, false),
         ctrl: bind_or_exit(net::CTRLPORT, false),
     };
-    // transport_init / transport_start: USB comes in slice 5.
+    // C transport_init (no root check, see usb::start) and
+    // transport_start: USB, then the inet listener.
+    crate::usb::start(crate::tokens::TokenStore::user_home());
     inet::start_listener();
     main_loop(&listeners)
 }
