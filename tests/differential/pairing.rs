@@ -33,15 +33,30 @@ fn rust_client() -> PathBuf {
 
 /// Runs a client to completion (at most [`TIMEOUT`]).
 fn run_client(path: &Path, arg0: &str, args: &[&str]) -> Outcome {
+    run_client_with(path, arg0, args, None)
+}
+
+/// Runs a client with `stdin` piped in (or no stdin).
+fn run_client_with(path: &Path, arg0: &str, args: &[&str], stdin: Option<&[u8]>) -> Outcome {
     let mut child = Command::new(path)
         .arg0(arg0)
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("POSIXLY_CORRECT")
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {}: {e}", path.display()));
+    if let (Some(data), Some(mut w)) = (stdin, child.stdin.take()) {
+        let data = data.to_vec();
+        std::thread::spawn(move || {
+            let _ = w.write_all(&data);
+        });
+    }
     let out = spawn_reader(child.stdout.take().expect("stdout"));
     let err = spawn_reader(child.stderr.take().expect("stderr"));
     let deadline = Instant::now() + TIMEOUT;
@@ -127,4 +142,133 @@ fn every_client_with_every_daemon() {
     assert_eq!(first.missing.stderr, b"unable to find device\n");
     assert_eq!(first.found.status, "exit 1");
     assert_ne!(first.found.stderr, first.missing.stderr, "device found");
+}
+
+/// Commands run by every client against every daemon, with the stdin
+/// piped in and the expected (exit, stdout, stderr).
+const STDIN: &[u8] = b"line one\nline\0two\n";
+
+/// Client arguments, piped stdin, expected outcome.
+type Case = (Vec<&'static str>, Option<&'static [u8]>, Outcome);
+
+fn command_cases() -> Vec<Case> {
+    let o = |code: i32, out: &[u8], err: &[u8]| Outcome {
+        status: format!("exit {code}"),
+        stdout: out.to_vec(),
+        stderr: err.to_vec(),
+    };
+    vec![
+        (
+            vec!["-d", DEV_STR, "--", "run", "file:///bin/echo", "hi"],
+            None,
+            o(0, b"hi\n", b""),
+        ),
+        (
+            vec!["-d", DEV_STR, "run", "file:///bin/cat"],
+            Some(STDIN),
+            o(0, STDIN, b""),
+        ),
+        (
+            vec!["-d", DEV_STR, "run", "file:///bin/false"],
+            None,
+            // The clients print this for any non-zero return code.
+            o(3, b"", b"failed\nnovacom: unexpected EOF from server\n"),
+        ),
+    ]
+}
+
+/// Payloads of complete stream packets in `s`: (type, payload).
+fn stream_packets(mut s: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let mut v = Vec::new();
+    while s.len() >= 16 {
+        let w = |i: usize| u32::from_le_bytes([s[i], s[i + 1], s[i + 2], s[i + 3]]);
+        let (size, kind) = (w(8) as usize, w(12));
+        if s.len() < 16 + size {
+            break;
+        }
+        v.push((kind, s[16..16 + size].to_vec()));
+        s = &s[16 + size..];
+    }
+    v
+}
+
+/// The fake device's command interpreter for one channel: `echo`, `cat`
+/// (stdin echoed until the client's OOB EOF) and `false` (exit 3).
+fn serve_command(dev: &pmux::Pmux, ch: u32) {
+    use pmux::*;
+    let line = dev.wait_line(ch);
+    let cmd = String::from_utf8_lossy(&line).into_owned();
+    assert!(dev.send(ch, b"ok 0\n"));
+    if let Some(args) = cmd.strip_prefix("run file:///bin/echo ") {
+        assert!(dev.send(ch, &stream_packet(S_DATA, args.as_bytes())));
+        let _ = dev.send(ch, &oob(OOB_RETURN, 0));
+    } else if cmd == "run file:///bin/cat\n" {
+        let is_eof = |p: &(u32, Vec<u8>)| p.0 == S_OOB && p.1.first() == Some(&(OOB_EOF as u8));
+        let s = dev.wait_stream(ch, |s| stream_packets(&s[line.len()..]).iter().any(is_eof));
+        let echoed: Vec<u8> = stream_packets(&s[line.len()..])
+            .into_iter()
+            .take_while(|p| !is_eof(p))
+            .filter(|p| p.0 == S_DATA)
+            .flat_map(|p| p.1)
+            .collect();
+        assert!(dev.send(ch, &stream_packet(S_DATA, &echoed)));
+        let _ = dev.send(ch, &oob(OOB_RETURN, 0));
+    } else if cmd == "run file:///bin/false\n" {
+        assert!(dev.send(ch, &stream_packet(S_ERR, b"failed\n")));
+        let _ = dev.send(ch, &oob(OOB_RETURN, 3));
+    } else {
+        panic!("unexpected command {cmd:?}");
+    }
+    // The client exits after the return code; the host closes the channel.
+    // That close can drop the host's ack of the return code (a C race,
+    // kept), so the last send above may end without an ack.
+    dev.wait_control(CLOSE, ch);
+}
+
+#[test]
+fn commands_with_every_client_and_daemon() {
+    let (c_client, rust_client) = (c_client(), rust_client());
+    let daemon_alias = Alias::new(&rovacomd(), "novacomd");
+    let client_alias = Alias::new(&rust_client, "novacom");
+    let daemons = [
+        ("C novacomd", Bin::c_alias()),
+        ("rovacomd", Bin::rust()),
+        ("rovacomd as novacomd", Bin::rust_alias(&daemon_alias)),
+    ];
+    let clients: [(&str, &Path, &str); 3] = [
+        ("C novacom", &c_client, "novacom"),
+        ("rovacom", &rust_client, "rovacom"),
+        ("rovacom as novacom", client_alias.path(), "novacom"),
+    ];
+    let cases = command_cases();
+    let _s = session();
+    for (dname, bin) in &daemons {
+        let mut d = Daemon::spawn(bin, &[]);
+        d.wait_ready();
+        let dev = std::sync::Arc::new(pmux::Pmux::connect(DEV));
+        wait_list(|l| lines(l) == 1);
+        let runs = clients.len() * cases.len();
+        let server = {
+            let dev = std::sync::Arc::clone(&dev);
+            std::thread::spawn(move || {
+                for n in 0..runs {
+                    let ch = dev.wait_open(n);
+                    serve_command(&dev, ch);
+                }
+            })
+        };
+        for (cname, path, arg0) in &clients {
+            for (args, stdin, want) in &cases {
+                let got = run_client_with(path, arg0, args, *stdin);
+                assert_eq!(&got, want, "{cname} with {dname}: {args:?}");
+            }
+        }
+        server
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+        let t = dev.transcript();
+        assert!(t.anomalies.is_empty(), "{dname}: {:?}", t.anomalies);
+        let out = d.stop();
+        assert_eq!(out.stderr, b"", "{dname}");
+    }
 }

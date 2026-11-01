@@ -4,17 +4,19 @@
 //!
 //! Main loop (C `select`, here `poll`, P5): the device-list (6968),
 //! option (64022), unblock (12311), log (6970) and control (6971)
-//! listeners and the accepted unblock connection. Per-device listen
-//! sockets and client data sockets join it with the mux (slice 2).
+//! listeners, the accepted unblock connection, every per-device listen
+//! socket and every client data socket that is not squelched. A client of
+//! a per-device port gets a command channel on the device (C
+//! `socketchan`); bytes are relayed both ways unchanged.
 
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::cli::{self, Getopt, NextOpt, ParseContext};
-use crate::{cmdparse, devices, inet, log, net, sys};
+use crate::{cmdparse, devices, inet, log, mux, net, sys};
 
 /// C `TRANSPORT_RECOVERY_TIMEOUT`.
 const RECOVERY_TIMEOUT_DEFAULT: i32 = 5;
@@ -28,6 +30,14 @@ const USBIO_RETRY_MAX: i32 = 500;
 const OPT_MAX: u32 = 4096;
 /// Control port: C `char cmd[128]`, read with `recv(..., 127)`.
 const CTRL_CMD_SIZE: usize = 128;
+/// C `TX_QUEUE_UPPER`: a client is squelched while its channel queues more.
+const TX_QUEUE_UPPER: usize = 64 * 1024;
+/// C `TX_QUEUE_LOWER`: a squelched client resumes below this.
+const TX_QUEUE_LOWER: usize = 32 * 1024;
+/// C `sdata[8*1024]`: client bytes read per pass.
+const CLIENT_CHUNK: usize = 8 * 1024;
+/// C `(uint32_t)-1`: the channel of a failed or closed socketchan.
+const NO_CHANNEL: u32 = u32::MAX;
 /// Control-port reply when a device command cannot be queued (NUL included).
 const INVALID_COMMAND: &[u8] = b"invalid command\n\0";
 
@@ -235,13 +245,146 @@ struct Listeners {
     ctrl: TcpListener,
 }
 
-/// C `main_loop`, without device and client sockets (slice 2).
+/// The part of C `struct socketchan` that the transport thread uses.
+struct ClientChan {
+    stream: TcpStream,
+    close: AtomicBool,
+    channel: AtomicU32,
+    partial_pos: Mutex<usize>,
+}
+
+impl mux::ClientReader for ClientChan {
+    /// C `socketchan_read_callback`: one non-blocking `send` to the client.
+    /// A short or refused send withholds the ack, so the device
+    /// retransmits; `partial_pos` remembers what was sent.
+    fn read(&self, _channel: u32, data: Option<&[u8]>) -> i32 {
+        let Some(buf) = data else {
+            self.close.store(true, Ordering::SeqCst);
+            self.channel.store(NO_CHANNEL, Ordering::SeqCst);
+            unblock_main_loop();
+            return 0;
+        };
+        if self.close.load(Ordering::SeqCst) {
+            unblock_main_loop();
+            return 0;
+        }
+        let mut pos = self
+            .partial_pos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Intentional change: a retransmission shorter than what was sent
+        // already makes C pass a wrapped length to `send`; here that is a
+        // send error.
+        let sent = match buf.get(*pos..) {
+            Some(rest) => (&self.stream).write(rest),
+            None => Err(ErrorKind::InvalidInput.into()),
+        };
+        match sent {
+            Ok(n) if n > 0 => {
+                *pos += n;
+                if *pos == buf.len() {
+                    *pos = 0;
+                    return 0;
+                }
+                -1
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => -1,
+            _ => {
+                self.close.store(true, Ordering::SeqCst);
+                unblock_main_loop();
+                -1
+            }
+        }
+    }
+}
+
+/// C `struct socketchan`, owned by the main loop.
+struct SocketChan {
+    chan: Arc<ClientChan>,
+    device: Arc<mux::Device>,
+    tx_squelch: bool,
+}
+
+/// C `socketchan_write_callback`.
+fn wake_main_loop() -> mux::Notify {
+    Box::new(unblock_main_loop)
+}
+
+/// C `novacom_register_client`: the socketchan is listed first, then the
+/// command channel is opened, blocking the main loop until the device
+/// acknowledges (D9).
+fn register_client(list: &mut Vec<SocketChan>, device: &Arc<mux::Device>, stream: TcpStream) {
+    let chan = Arc::new(ClientChan {
+        stream,
+        close: AtomicBool::new(false),
+        channel: AtomicU32::new(0),
+        partial_pos: Mutex::new(0),
+    });
+    list.insert(
+        0,
+        SocketChan {
+            chan: Arc::clone(&chan),
+            device: Arc::clone(device),
+            tx_squelch: false,
+        },
+    );
+    let (num, rc) = device.open_temp_channel();
+    chan.channel.store(num, Ordering::SeqCst);
+    if rc < 0 {
+        chan.channel.store(NO_CHANNEL, Ordering::SeqCst);
+        return;
+    }
+    let reader: Arc<dyn mux::ClientReader> = chan.clone();
+    if device
+        .with(|m| m.set_reader(num, Some(mux::Reader::Client(reader))))
+        .is_err()
+    {
+        // The device went away during the open.
+        chan.channel.store(NO_CHANNEL, Ordering::SeqCst);
+        chan.close.store(true, Ordering::SeqCst);
+    }
+}
+
+/// C `destroy_socketchan`. As in C, a channel of `(uint32_t)-1` is also
+/// "closed" (D32).
+fn destroy_socketchan(sc: SocketChan) {
+    let ch = sc.chan.channel.load(Ordering::SeqCst);
+    if ch > 0 {
+        sc.device.with(|m| {
+            let _ = m.set_reader(ch, None);
+            let _ = m.close_channel(ch);
+        });
+    }
+    let _ = sc.chan.stream.shutdown(Shutdown::Both);
+    // The socket closes with the last reference, which is this one.
+}
+
+/// C `main_loop`.
 fn main_loop(l: &Listeners) -> ! {
     // C `unblock_fd_read`; earlier connections replaced by a new accept
     // stay open (leaked in C, D10).
     let mut unblock_read: Option<TcpStream> = None;
     let mut leaked: Vec<TcpStream> = Vec::new();
+    // C `socketchan_list`: newest first.
+    let mut chans: Vec<SocketChan> = Vec::new();
+    let mut sdata = vec![0u8; CLIENT_CHUNK];
     loop {
+        let mut i = 0;
+        while i < chans.len() {
+            if chans[i].chan.close.load(Ordering::SeqCst) {
+                destroy_socketchan(chans.remove(i));
+                continue;
+            }
+            let sc = &mut chans[i];
+            if sc.tx_squelch {
+                let ch = sc.chan.channel.load(Ordering::SeqCst);
+                if sc.device.with(|m| m.tx_queue_len(ch)) < TX_QUEUE_LOWER {
+                    sc.tx_squelch = false;
+                }
+            }
+            i += 1;
+        }
+
         let mut fds = vec![
             l.devlist.as_raw_fd(),
             l.opt.as_raw_fd(),
@@ -249,14 +392,37 @@ fn main_loop(l: &Listeners) -> ! {
             l.log.as_raw_fd(),
             l.ctrl.as_raw_fd(),
         ];
-        if let Some(s) = &unblock_read {
+        let unblock_at = unblock_read.as_ref().map(|s| {
             fds.push(s.as_raw_fd());
-        }
+            fds.len() - 1
+        });
+        let polled: Vec<(Arc<ClientChan>, usize)> = chans
+            .iter()
+            .filter(|sc| !sc.tx_squelch)
+            .map(|sc| {
+                fds.push(sc.chan.stream.as_raw_fd());
+                (Arc::clone(&sc.chan), fds.len() - 1)
+            })
+            .collect();
+        // Per-pass device references. Intentional change (D11): a device
+        // without a listen socket is not polled (C passes fd -1 to
+        // `FD_SET`).
+        let devs = devices::snapshot();
+        let dev_at: Vec<Option<usize>> = devs
+            .iter()
+            .map(|d| {
+                d.listener.as_ref().map(|lst| {
+                    fds.push(lst.as_raw_fd());
+                    fds.len() - 1
+                })
+            })
+            .collect();
         let Ok(ready) = sys::poll_readable(&fds) else {
             continue;
         };
+        let is_ready = |at: Option<usize>| at.is_some_and(|i| ready[i]);
         let [devlist, opt, unblock, log_ready, ctrl] = [0, 1, 2, 3, 4].map(|i| ready[i]);
-        let mut unblock_read_ready = ready.get(5).copied().unwrap_or(false);
+        let mut unblock_read_ready = is_ready(unblock_at);
 
         if unblock {
             let new = l.unblock.accept().ok().map(|(s, _)| s);
@@ -294,6 +460,60 @@ fn main_loop(l: &Listeners) -> ! {
                 register_command(&s);
             }
         }
+        // C walks its per-pass list, which is oldest device first.
+        for (d, at) in devs.iter().zip(&dev_at).rev() {
+            if !is_ready(*at) {
+                continue;
+            }
+            if let Some(Ok((s, _))) = d.listener.as_ref().map(TcpListener::accept) {
+                // "Set non-blocking or novacomd will drop offline if the
+                // socket fills up."
+                let _ = s.set_nonblocking(true);
+                register_client(&mut chans, &d.mux, s);
+            }
+        }
+        drop(devs);
+
+        for sc in &mut chans {
+            if sc.chan.close.load(Ordering::SeqCst) {
+                continue;
+            }
+            let Some((_, at)) = polled.iter().find(|(c, _)| Arc::ptr_eq(c, &sc.chan)) else {
+                continue;
+            };
+            if !ready[*at] {
+                continue;
+            }
+            relay_from_client(sc, &mut sdata);
+        }
+    }
+}
+
+/// Client data on a ready socket: C `recv_socket` of up to 8 KiB, queued
+/// on the channel; EOF or an error closes the socketchan in the next pass.
+///
+/// C retries a `recv` that would block, logging each try (D29); after a
+/// ready `poll` that cannot happen, so here such a pass reads nothing.
+fn relay_from_client(sc: &mut SocketChan, sdata: &mut [u8]) {
+    let n = match (&sc.chan.stream).read(sdata) {
+        Ok(0) => {
+            sc.chan.close.store(true, Ordering::SeqCst);
+            return;
+        }
+        Ok(n) => n,
+        Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+        Err(_) => {
+            sc.chan.close.store(true, Ordering::SeqCst);
+            return;
+        }
+    };
+    let ch = sc.chan.channel.load(Ordering::SeqCst);
+    let queued = sc.device.with(|m| {
+        let _ = m.write(ch, &sdata[..n], Some(wake_main_loop()));
+        m.tx_queue_len(ch)
+    });
+    if queued > TX_QUEUE_UPPER {
+        sc.tx_squelch = true;
     }
 }
 

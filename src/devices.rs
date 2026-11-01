@@ -3,43 +3,43 @@
 //! `novacom_removedup_device`, `dump_device_list`) and of the registration
 //! parts of `novacom_go_online` / `novacom_go_offline` (`mux.c`).
 //!
-//! Slice 1 has no mux: a device is its registry entry plus its listen
-//! socket. Accepting clients on that socket comes with the mux (slice 2);
-//! until then connections wait in the backlog. Session ids come only from
-//! USB SYN data, so no device here has one.
+//! A device is its registry entry, its mux and its listen socket. The main
+//! loop takes a [`snapshot`] (the C per-pass references), so a listen
+//! socket stays open until the pass that saw it ends. Session ids come
+//! only from USB SYN data, so no device here has one.
 
 use std::io::Write;
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::{log, net, server};
+use crate::{log, mux, net, server};
 
 /// C `NOVACOM_NDUID_CHRLEN`.
 pub const NDUID_CHRLEN: usize = 40;
 
-/// Identifies one `go_online` registration (the C mux pointer).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Handle(u64);
-
-static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
-
-struct Device {
-    handle: Handle,
+/// One registered device (C `struct active_device`).
+pub struct Device {
+    pub mux: Arc<mux::Device>,
     devid: Vec<u8>,
     conntype: Vec<u8>,
     devtype: Vec<u8>,
     /// Port of `listener`; 0 if the listen socket failed (D11).
     port: i32,
-    /// Closed when the device leaves the list.
-    _listener: Option<TcpListener>,
+    /// The per-device port; closed with the last reference.
+    pub listener: Option<TcpListener>,
 }
 
 /// C `device_list`: newest first.
-static DEVICES: Mutex<Vec<Device>> = Mutex::new(Vec::new());
+static DEVICES: Mutex<Vec<Arc<Device>>> = Mutex::new(Vec::new());
 
-fn lock() -> MutexGuard<'static, Vec<Device>> {
+fn lock() -> MutexGuard<'static, Vec<Arc<Device>>> {
     DEVICES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The listed devices, newest first (C `main_loop` takes a reference to
+/// each for one pass).
+pub fn snapshot() -> Vec<Arc<Device>> {
+    lock().clone()
 }
 
 /// C `strncasecmp(a, b, n) == 0` on C strings (a missing byte is NUL).
@@ -75,21 +75,21 @@ pub fn format_line(port: i32, devid: &[u8], conntype: &[u8], devtype: &[u8]) -> 
 }
 
 /// C `novacom_go_online(nduid, conntype, devtype, NULL)`.
-pub fn go_online(nduid: &[u8], conntype: &[u8], devtype: &[u8]) -> Handle {
-    let handle = Handle(NEXT_HANDLE.fetch_add(1, Ordering::Relaxed));
+pub fn go_online(nduid: &[u8], conntype: &[u8], devtype: &[u8]) -> Arc<mux::Device> {
+    let dev = mux::Device::new();
     log::always(&[b"novacom_go_online:", nduid, b"\n"].concat());
-    register_device(handle, nduid, conntype, devtype);
-    handle
+    register_device(&dev, nduid, conntype, devtype);
+    dev
 }
 
 /// C `novacom_go_offline`.
-pub fn go_offline(handle: Handle) {
+pub fn go_offline(dev: &mux::Device) {
     log::trace(b"novacom_go_offline:762: going offline\n");
-    unregister_device(handle);
+    dev.go_offline(|| unregister_device(dev.id()));
 }
 
 /// C `novacom_register_device`.
-fn register_device(handle: Handle, devid: &[u8], conntype: &[u8], devtype: &[u8]) {
+fn register_device(dev: &Arc<mux::Device>, devid: &[u8], conntype: &[u8], devtype: &[u8]) {
     log::always(
         &[
             b"dev '", devid, b"' via ", conntype, b" type ", devtype, b"\n",
@@ -104,14 +104,14 @@ fn register_device(handle: Handle, devid: &[u8], conntype: &[u8], devtype: &[u8]
         .map_or(0, |a| i32::from(a.port()));
     lock().insert(
         0,
-        Device {
-            handle,
+        Arc::new(Device {
+            mux: Arc::clone(dev),
             devid: devid.to_vec(),
             conntype: conntype.to_vec(),
             devtype: devtype.to_vec(),
             port,
-            _listener: listener,
-        },
+            listener,
+        }),
     );
 }
 
@@ -138,7 +138,7 @@ fn removedup_device(devid: &[u8], conntype: &[u8]) {
                     ]
                     .concat(),
                 );
-                d.handle
+                d.mux.id()
             })
     };
     if let Some(h) = dup {
@@ -147,10 +147,13 @@ fn removedup_device(devid: &[u8], conntype: &[u8]) {
 }
 
 /// C `novacom_unregister_device`.
-pub fn unregister_device(handle: Handle) {
+///
+/// The listen socket closes when the last [`snapshot`] holding the device
+/// is dropped.
+pub fn unregister_device(id: u64) {
     {
         let mut list = lock();
-        if let Some(i) = list.iter().position(|d| d.handle == handle) {
+        if let Some(i) = list.iter().position(|d| d.mux.id() == id) {
             log::always(&[b"removing id ", &list[i].devid[..], b"\n"].concat());
             list.remove(i);
         }

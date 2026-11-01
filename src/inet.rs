@@ -6,9 +6,10 @@
 //! frame `"ELTSDIM\0"` + `u32` length + one pmux packet (length 0 =
 //! keepalive, sent after 2 s without traffic).
 //!
-//! Slice 1 has no mux: received packets are read and dropped, and the tx
-//! side only sends keepalives. C never ends the link on a bad pmux packet
-//! (`novacom_process_packet` never returns `PACKET_TYPE_BADPACKET`).
+//! Received packets go to the mux; the tx thread sends what the mux has
+//! (an empty frame after 2 s without any). C never ends the link on a bad
+//! pmux packet (`novacom_process_packet` never returns
+//! `PACKET_TYPE_BADPACKET`).
 
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::devices::{self, NDUID_CHRLEN};
-use crate::{log, net, server, sys};
+use crate::{log, mux, net, server, sys};
 
 /// C `NDUID_MAGIC` with its NUL.
 pub const NDUID_MAGIC: &[u8; 8] = b"nduid: \0";
@@ -120,12 +121,17 @@ fn rx_loop(stream: TcpStream) {
         log::error(format!("invalid connection packet, read({n}/{SYN_LEN})\n").as_bytes());
         return;
     };
-    let handle = devices::go_online(&peer, b"tcp", b"emulator");
+    let dev = devices::go_online(&peer, b"tcp", b"emulator");
     let shutdown = Arc::new(AtomicBool::new(false));
     let tx = {
-        let (stream, shutdown) = (Arc::clone(&stream), Arc::clone(&shutdown));
-        spawn(move || tx_loop(&stream, &shutdown))
+        let (stream, shutdown, dev) =
+            (Arc::clone(&stream), Arc::clone(&shutdown), Arc::clone(&dev));
+        spawn(move || tx_loop(&stream, &shutdown, &dev))
     };
+    // C reuses one uninitialized `IP_MAX_PACKET_SIZE` buffer, and the mux
+    // reads stale bytes from it (D17). Intentional change: it starts
+    // zeroed.
+    let mut buf = vec![0u8; IP_MAX_PACKET_SIZE as usize];
     loop {
         let mut hdr = [0u8; HEADER_LEN];
         let n = net::read_full(&stream, &mut hdr);
@@ -143,31 +149,35 @@ fn rx_loop(stream: TcpStream) {
         #[cfg(target_os = "linux")]
         sys::tcp_quickack(&stream);
         if len > 0 {
-            let mut body = vec![0u8; len as usize];
-            let n = net::read_full(&stream, &mut body);
+            let n = net::read_full(&stream, &mut buf[..len as usize]);
             if n != len as isize {
                 log::trace(
                     format!("inet_rx_loop:198: invalid data length ({n}/{len})\n").as_bytes(),
                 );
                 break;
             }
-            // novacom_process_packet: slice 2 (mux).
+            dev.process_packet(&buf, len as usize);
         }
     }
     // C sets the tx shutdown flag and waits for the tx thread, which
-    // finishes its current 2 s wait and sends one more keepalive first.
+    // finishes its current `novacom_get_tx_packet` and sends once more.
     shutdown.store(true, Ordering::Relaxed);
     let _ = tx.join();
-    devices::go_offline(handle);
+    devices::go_offline(&dev);
 }
 
-/// C `inet_tx_loop`: without mux traffic, every `novacom_get_tx_packet`
-/// call times out after 2 s and a zero-length frame is sent.
-fn tx_loop(stream: &TcpStream, shutdown: &AtomicBool) {
+/// C `inet_tx_loop`: one frame per `novacom_get_tx_packet` call, empty
+/// when it returns no packet within 2 s.
+fn tx_loop(stream: &TcpStream, shutdown: &AtomicBool, dev: &mux::Device) {
     while !shutdown.load(Ordering::Relaxed) {
-        std::thread::sleep(KEEPALIVE);
-        // One send; the result is ignored, as in C.
-        let _ = std::io::Write::write(&mut &*stream, &encode_header(0));
+        let pkt = dev
+            .get_tx_packet(KEEPALIVE, IP_MAX_PACKET_SIZE as usize)
+            .unwrap_or_default();
+        // pkt.len() <= IP_MAX_PACKET_SIZE.
+        let mut frame = encode_header(pkt.len() as u32).to_vec();
+        frame.extend_from_slice(&pkt);
+        // One send; the result is ignored, as in C (D27).
+        let _ = std::io::Write::write(&mut &*stream, &frame);
     }
 }
 

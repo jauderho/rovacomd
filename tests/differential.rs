@@ -17,6 +17,10 @@ mod daemon;
 mod guard;
 #[path = "differential/pairing.rs"]
 mod pairing;
+#[path = "differential/pmux.rs"]
+mod pmux;
+#[path = "differential/relay.rs"]
+mod relay;
 
 use std::ffi::OsString;
 use std::fmt;
