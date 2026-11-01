@@ -49,6 +49,21 @@ pub fn listen_all() -> bool {
     LISTEN_ALL.load(Ordering::Relaxed)
 }
 
+/// C `g_recovery_timeout` (`-t`, seconds).
+pub fn recovery_timeout() -> i32 {
+    RECOVERY_TIMEOUT.load(Ordering::Relaxed)
+}
+
+/// C `g_usbio_retry_timeout` (`-e`, milliseconds).
+pub fn usbio_retry_timeout() -> i32 {
+    USBIO_RETRY_TIMEOUT.load(Ordering::Relaxed)
+}
+
+/// C `g_usbio_retry_delay` (`-s`, milliseconds).
+pub fn usbio_retry_delay() -> i32 {
+    USBIO_RETRY_DELAY.load(Ordering::Relaxed)
+}
+
 /// C `unblock_fd_write`.
 static UNBLOCK_WRITE: Mutex<Option<TcpStream>> = Mutex::new(None);
 
@@ -81,7 +96,7 @@ fn usage() {
 }
 
 /// The C string at the start of `b` (up to the first NUL).
-fn c_str(b: &[u8]) -> &[u8] {
+pub(crate) fn c_str(b: &[u8]) -> &[u8] {
     &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
 }
 

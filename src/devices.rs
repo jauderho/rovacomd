@@ -104,6 +104,108 @@ pub fn go_online(
     (dev, init)
 }
 
+/// C `NOVACOMD_DATATOKEN_ID`, `_MODE`, `_SESSION` with the sizes of the C
+/// buffers their words are copied into (`devname[64]`, `devmode[16]`,
+/// `sessionid[16]`).
+const DATATOKEN_ID: (&[u8], usize) = (b"id:", 64);
+const DATATOKEN_MODE: (&[u8], usize) = (b"mode:", 16);
+const DATATOKEN_SESSION: (&[u8], usize) = (b"sn:", 16);
+
+/// C `parse_devdata(devdata, token, data, size)`: in the C string
+/// `devdata`, the first word (`strtok` on `" \t\n"`) after the first
+/// occurrence of `token`, cut to `size - 1` bytes.
+pub fn parse_devdata(devdata: &[u8], token: &[u8], size: usize) -> Option<Vec<u8>> {
+    let s = server::c_str(devdata);
+    let at = s.windows(token.len()).position(|w| w == token)?;
+    let word = s[at + token.len()..]
+        .split(|b| b" \t\n".contains(b))
+        .find(|w| !w.is_empty())?;
+    Some(word[..word.len().min(size - 1)].to_vec())
+}
+
+/// What C `novacom_go_online` registers from its arguments: the device
+/// type, the mode (only traced) and the session id (empty if none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegInfo {
+    pub devtype: Vec<u8>,
+    pub devmode: Vec<u8>,
+    pub sessionid: Vec<u8>,
+}
+
+/// The `devtype`/`devdata` part of C `novacom_go_online`: the device type
+/// is the SYN `id:` word, else `devtype` if not empty, else `[unknown]`.
+/// `trace` gets the C trace lines (mask, text).
+pub fn reginfo(
+    devtype: &[u8],
+    devdata: Option<&[u8]>,
+    trace: &mut dyn FnMut(u32, &[u8]),
+) -> RegInfo {
+    let mut info = RegInfo {
+        devtype: if devtype.is_empty() {
+            b"[unknown]".to_vec()
+        } else {
+            devtype.to_vec()
+        },
+        devmode: Vec::new(),
+        sessionid: Vec::new(),
+    };
+    let Some(data) = devdata else {
+        return info;
+    };
+    let (token, size) = DATATOKEN_ID;
+    if let Some(name) = parse_devdata(data, token, size) {
+        trace(
+            log::LOG_TRACE,
+            &[
+                b"novacom_go_online:720: id:",
+                &name[..],
+                b"/(",
+                devtype,
+                b")\n",
+            ]
+            .concat(),
+        );
+        info.devtype = name;
+    }
+    let (token, size) = DATATOKEN_MODE;
+    if let Some(mode) = parse_devdata(data, token, size) {
+        trace(
+            log::LOG_TRACE,
+            &[b"novacom_go_online:724: mode:", &mode[..], b"\n"].concat(),
+        );
+        info.devmode = mode;
+    }
+    let (token, size) = DATATOKEN_SESSION;
+    if let Some(sid) = parse_devdata(data, token, size) {
+        trace(
+            log::LOG_TRACE,
+            &[b"novacom_go_online:728: sn:", &sid[..], b"\n"].concat(),
+        );
+        info.sessionid = sid;
+    }
+    info
+}
+
+/// C `novacom_go_online(nduid, "usb", devtype, devdata)` (a USB link after
+/// its SYN). The command service of a device with a session id keeps its
+/// tokens in `tokens`; its init thread is returned as by [`go_online`].
+pub fn go_online_usb(
+    nduid: &[u8],
+    devtype: &[u8],
+    devdata: Option<&[u8]>,
+    tokens: TokenStore,
+) -> (Arc<mux::Device>, Option<JoinHandle<()>>) {
+    let dev = mux::Device::new();
+    log::always(&[b"novacom_go_online:", nduid, b"\n"].concat());
+    let info = reginfo(devtype, devdata, &mut log::log);
+    let session = Session {
+        id: info.sessionid,
+        tokens,
+    };
+    let init = register_device(&dev, nduid, b"usb", &info.devtype, Some(session));
+    (dev, init)
+}
+
 /// C `novacom_go_offline`.
 pub fn go_offline(dev: &mux::Device) {
     log::trace(b"novacom_go_offline:762: going offline\n");
@@ -258,5 +360,61 @@ mod tests {
         assert!(strncaseeq(b"anything", b"", 0));
         assert!(strncaseeq(b"TCP", b"tcp", 3));
         assert!(!strncaseeq(b"tc", b"tcp", 3));
+    }
+
+    #[test]
+    fn devdata_words_and_size_limits() {
+        let p = |d: &[u8], t: &[u8], n: usize| parse_devdata(d, t, n);
+        assert_eq!(p(b"id:castle sn:1", b"id:", 64), Some(b"castle".to_vec()));
+        assert_eq!(p(b"id:castle sn:1", b"sn:", 16), Some(b"1".to_vec()));
+        // Cut to size - 1: id 63, sn and mode 15.
+        let long = [b"id:".to_vec(), vec![b'i'; 70]].concat();
+        assert_eq!(p(&long, b"id:", 64), Some(vec![b'i'; 63]));
+        let sn = [b"sn:".to_vec(), vec![b'7'; 16]].concat();
+        assert_eq!(p(&sn, b"sn:", 16), Some(vec![b'7'; 15]));
+        // strtok: leading separators skipped; the word may be the next token.
+        assert_eq!(p(b"id: \t\nx\ty", b"id:", 64), Some(b"x".to_vec()));
+        assert_eq!(p(b"sn: id:foo", b"sn:", 16), Some(b"id:foo".to_vec()));
+        // strstr: the token may sit inside a word; the first one counts.
+        assert_eq!(p(b"uuid:abc id:def", b"id:", 64), Some(b"abc".to_vec()));
+        // Missing token or word, or after the C string's end.
+        assert_eq!(p(b"mode:x", b"id:", 64), None);
+        assert_eq!(p(b"id:   ", b"id:", 64), None);
+        assert_eq!(p(b"x\0id:y", b"id:", 64), None);
+        assert_eq!(p(b"", b"id:", 64), None);
+    }
+
+    #[test]
+    fn reginfo_device_type_choice_and_traces() {
+        let lines = std::cell::RefCell::new(Vec::new());
+        let mut rec = |m: u32, b: &[u8]| lines.borrow_mut().push((m, b.to_vec()));
+        let info = reginfo(b"", None, &mut rec);
+        assert_eq!(info.devtype, b"[unknown]");
+        assert_eq!(
+            reginfo(b"pixie-linux", None, &mut rec).devtype,
+            b"pixie-linux"
+        );
+        let info = reginfo(b"", Some(b"nothing"), &mut rec);
+        assert_eq!(
+            (info.devtype, info.devmode, info.sessionid),
+            (b"[unknown]".to_vec(), Vec::new(), Vec::new())
+        );
+        assert!(lines.borrow().is_empty());
+        let info = reginfo(b"castle-linux", Some(b"mode:m id:dev sn:s"), &mut rec);
+        assert_eq!(
+            (info.devtype, info.devmode, info.sessionid),
+            (b"dev".to_vec(), b"m".to_vec(), b"s".to_vec())
+        );
+        assert_eq!(
+            *lines.borrow(),
+            [
+                (
+                    log::LOG_TRACE,
+                    b"novacom_go_online:720: id:dev/(castle-linux)\n".to_vec()
+                ),
+                (log::LOG_TRACE, b"novacom_go_online:724: mode:m\n".to_vec()),
+                (log::LOG_TRACE, b"novacom_go_online:728: sn:s\n".to_vec()),
+            ]
+        );
     }
 }

@@ -62,7 +62,9 @@ pub fn adler(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
-fn u32_at(buf: &[u8], at: usize) -> u32 {
+/// The `u32` at `at` (host byte order); bytes past the end of `buf` read
+/// as zero.
+pub(crate) fn u32_at(buf: &[u8], at: usize) -> u32 {
     let mut w = [0u8; 4];
     for (i, b) in w.iter_mut().enumerate() {
         *b = buf.get(at + i).copied().unwrap_or(0);
@@ -607,20 +609,20 @@ impl Mux {
 /// One-shot event with a waiter (C `platform_event_t` used by
 /// `novacom_write_channel_sync`).
 #[derive(Default)]
-struct Event {
+pub(crate) struct Event {
     done: Mutex<bool>,
     cv: Condvar,
 }
 
 impl Event {
-    fn signal(&self) {
+    pub(crate) fn signal(&self) {
         *self.done.lock().unwrap_or_else(PoisonError::into_inner) = true;
         self.cv.notify_all();
     }
 
     /// Intentional change (D25): C waits under `if`, so a spurious wake-up
     /// ends its wait early; here it waits until signalled.
-    fn wait(&self) {
+    pub(crate) fn wait(&self) {
         let mut d = self.done.lock().unwrap_or_else(PoisonError::into_inner);
         while !*d {
             d = self.cv.wait(d).unwrap_or_else(PoisonError::into_inner);

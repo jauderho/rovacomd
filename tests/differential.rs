@@ -23,6 +23,8 @@ mod pairing;
 mod pmux;
 #[path = "differential/relay.rs"]
 mod relay;
+#[path = "differential/usbll.rs"]
+mod usbll;
 
 use std::ffi::OsString;
 use std::fmt;

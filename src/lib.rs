@@ -14,4 +14,6 @@ pub mod server;
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod tokens;
+pub mod usb;
+pub mod usbll;
 pub mod wirebuf;

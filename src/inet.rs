@@ -98,7 +98,7 @@ pub fn decode_header(h: &[u8; HEADER_LEN]) -> Option<u32> {
 ///
 /// Intentional change: C logs `ASSERT FAILED ...` and crashes with
 /// SIGSEGV; this aborts without the message.
-fn spawn(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+pub(crate) fn spawn(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
     std::thread::Builder::new()
         .spawn(f)
         .unwrap_or_else(|_| std::process::abort())
