@@ -1,7 +1,8 @@
 //! Unix calls the C daemon makes that std does not expose: `time` /
 //! `localtime_r`, `srand` / `rand`, `isatty`, raw `write` on the standard
 //! fds, `poll` (in place of `select`), the `-d` steps (`fork`, `umask`,
-//! `setsid`, closing fds 0-2), `getaddrinfo`, `TCP_QUICKACK` and syslog.
+//! `setsid`, closing fds 0-2), `getpwuid_r`, `getaddrinfo`, `TCP_QUICKACK`
+//! and syslog.
 //!
 //! This is the only module with `unsafe` code.
 
@@ -142,6 +143,45 @@ pub fn close_std_fds() {
     }
 }
 
+/// C `getpwuid(getuid())->pw_dir` (`tokenstorage_path`), through the
+/// reentrant `getpwuid_r`. `None` if there is no entry or no home
+/// directory.
+pub fn home_dir() -> Option<Vec<u8>> {
+    let mut size = 1024;
+    loop {
+        let mut buf: Vec<libc::c_char> = vec![0; size];
+        // SAFETY: an all-zero `struct passwd` is a valid value (integers
+        // and null pointers).
+        let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pw`, `buf` (of `buf.len()` bytes) and `found` are live
+        // locals; `getpwuid_r` writes only into them.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut pw,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && size < 1 << 20 {
+            size *= 2;
+            continue;
+        }
+        if rc != 0 || found.is_null() || pw.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: on success `pw_dir` points to a NUL-terminated string
+        // inside `buf`, which is still alive.
+        return Some(
+            unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) }
+                .to_bytes()
+                .to_vec(),
+        );
+    }
+}
+
 /// C `getaddrinfo(host, serv, {AI_ALL|AI_ADDRCONFIG, SOCK_STREAM})` and
 /// the first result (`inetconnect_findandattach_thread`). `None` on error,
 /// on a non-IP first result, or if `host`/`serv` contain a NUL byte.
@@ -252,6 +292,13 @@ mod tests {
         );
         assert_eq!(resolve_first(b"127.0.0.1", b"nosuchservice"), None);
         assert_eq!(resolve_first(b"127.0.0.1", b"69\x0069"), None);
+    }
+
+    #[test]
+    fn home_dir_is_absolute() {
+        // Read-only lookup; nothing below the directory is touched.
+        let home = home_dir().unwrap();
+        assert!(home.starts_with(b"/"), "{home:?}");
     }
 
     #[test]

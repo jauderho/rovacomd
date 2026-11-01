@@ -121,7 +121,7 @@ fn rx_loop(stream: TcpStream) {
         log::error(format!("invalid connection packet, read({n}/{SYN_LEN})\n").as_bytes());
         return;
     };
-    let dev = devices::go_online(&peer, b"tcp", b"emulator");
+    let (dev, _) = devices::go_online(&peer, b"tcp", b"emulator", None);
     let shutdown = Arc::new(AtomicBool::new(false));
     let tx = {
         let (stream, shutdown, dev) =

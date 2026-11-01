@@ -144,6 +144,13 @@ pub trait ClientReader: Send + Sync {
     fn read(&self, channel: u32, data: Option<&[u8]>) -> i32;
 }
 
+/// Receiver of the service channel 0x50 (C `socketcmd_read_callback`).
+/// It gets the mux so that it can queue the next request: C re-enters its
+/// recursive mux lock from the callback.
+pub trait ServiceReader: Send + Sync {
+    fn read(&self, mux: &mut Mux, channel: u32, data: Option<&[u8]>) -> i32;
+}
+
 /// C `rx_callback` of a channel.
 #[derive(Clone)]
 pub enum Reader {
@@ -153,6 +160,7 @@ pub enum Reader {
     /// with `OPEN_COMMAND`, D1).
     Command,
     Client(Arc<dyn ClientReader>),
+    Service(Arc<dyn ServiceReader>),
 }
 
 /// C `struct novacom_channel`.
@@ -368,6 +376,7 @@ impl Mux {
     fn call_reader(&mut self, r: &Reader, chan: u32, data: Option<&[u8]>) -> i32 {
         match (r, data) {
             (Reader::Client(c), _) => c.read(chan, data),
+            (Reader::Service(sv), _) => sv.read(self, chan, data),
             (_, None) => 0,
             (Reader::Control, Some(d)) => self.control_read(d),
             (Reader::Command, Some(d)) => self.command_read(chan, d),
@@ -698,14 +707,25 @@ impl Device {
     /// until the device acknowledges the request or the mux goes offline
     /// (D9). Returns the number and the C result (0 or -1).
     pub fn open_temp_channel(&self) -> (u32, i32) {
+        self.open_and_wait(Mux::alloc_temp_channel, true)
+    }
+
+    /// C `novacom_open_channel(mux, num, command)`: opens channel `num` and
+    /// waits like [`Device::open_temp_channel`]. Returns 0 or -1.
+    pub fn open_channel(&self, num: u32, command: bool) -> i32 {
+        self.open_and_wait(|_| num, command).1
+    }
+
+    /// Opens the channel that `pick` chooses and waits for the device.
+    fn open_and_wait(&self, pick: impl FnOnce(&mut Mux) -> u32, command: bool) -> (u32, i32) {
         let ev = Arc::new(Event::default());
         let done = {
             let ev = Arc::clone(&ev);
             Box::new(move || ev.signal())
         };
         let (num, open) = self.with(|m| {
-            let num = m.alloc_temp_channel();
-            (num, m.open_channel(num, true, done))
+            let num = pick(m);
+            (num, m.open_channel(num, command, done))
         });
         match open {
             Open::Failed => (num, -1),

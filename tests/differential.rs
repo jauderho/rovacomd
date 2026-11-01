@@ -11,6 +11,8 @@
 
 #[path = "differential/cli.rs"]
 mod cli;
+#[path = "differential/cservice.rs"]
+mod cservice;
 #[path = "differential/daemon.rs"]
 mod daemon;
 #[path = "differential/guard.rs"]

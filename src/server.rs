@@ -1,6 +1,6 @@
 //! Program flow: emulation of C `main`, `parse_commandline`, `handleopt`,
-//! `novacomopt`, the `-d` steps, `main_loop` and the control-port part of
-//! `novacom_register_command` / `novacom_service_command`.
+//! `novacomopt`, the `-d` steps, `main_loop` and the control-port read of
+//! `novacom_register_command` (the rest is in [`crate::cmdservice`]).
 //!
 //! Main loop (C `select`, here `poll`, P5): the device-list (6968),
 //! option (64022), unblock (12311), log (6970) and control (6971)
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::cli::{self, Getopt, NextOpt, ParseContext};
-use crate::{cmdparse, devices, inet, log, mux, net, sys};
+use crate::{cmdservice, devices, inet, log, mux, net, sys};
 
 /// C `TRANSPORT_RECOVERY_TIMEOUT`.
 const RECOVERY_TIMEOUT_DEFAULT: i32 = 5;
@@ -28,8 +28,6 @@ const USBIO_RETRY_DELAY_DEFAULT: i32 = 50;
 const USBIO_RETRY_MAX: i32 = 500;
 /// Option port: requests whose lengths sum to this or more are ignored.
 const OPT_MAX: u32 = 4096;
-/// Control port: C `char cmd[128]`, read with `recv(..., 127)`.
-const CTRL_CMD_SIZE: usize = 128;
 /// C `TX_QUEUE_UPPER`: a client is squelched while its channel queues more.
 const TX_QUEUE_UPPER: usize = 64 * 1024;
 /// C `TX_QUEUE_LOWER`: a squelched client resumes below this.
@@ -38,8 +36,6 @@ const TX_QUEUE_LOWER: usize = 32 * 1024;
 const CLIENT_CHUNK: usize = 8 * 1024;
 /// C `(uint32_t)-1`: the channel of a failed or closed socketchan.
 const NO_CHANNEL: u32 = u32::MAX;
-/// Control-port reply when a device command cannot be queued (NUL included).
-const INVALID_COMMAND: &[u8] = b"invalid command\n\0";
 
 /// C globals set by `handleopt`. The USB values are used from slice 4 on.
 static LISTEN_ALL: AtomicBool = AtomicBool::new(false);
@@ -457,7 +453,7 @@ fn main_loop(l: &Listeners) -> ! {
         }
         if ctrl {
             if let Ok((s, _)) = l.ctrl.accept() {
-                register_command(&s);
+                register_command(s);
             }
         }
         // C walks its per-pass list, which is oldest device first.
@@ -542,61 +538,25 @@ fn handle_opt_connection(s: &TcpStream) {
     }
 }
 
-/// Control-port verbs (C `iohandlers`): `true` for device commands.
-fn lookup_handler(verb: &[u8], scheme: &[u8]) -> Option<bool> {
-    const HANDLERS: [(&[u8], &[u8], bool); 6] = [
-        (b"list", b"host", false),
-        (b"login", b"dev", true),
-        (b"logout", b"dev", true),
-        (b"logint", b"dev", true),
-        (b"add", b"dev", true),
-        (b"remove", b"dev", true),
-    ];
-    HANDLERS
-        .iter()
-        .find(|(v, s, _)| verb.eq_ignore_ascii_case(v) && scheme.eq_ignore_ascii_case(s))
-        .map(|&(_, _, remote)| remote)
-}
-
 /// C `novacom_register_command(socket, NULL)` for a control-port client:
-/// one `recv` of at most 127 bytes, which must hold a NUL.
-///
-/// `list host://` sends the device list. A device command needs a device
-/// with a session id to be queued on the service channel (slice 3); only
-/// USB devices have one, so every device command gets `invalid command`.
-/// Anything else gets no reply. The caller closes the socket.
-fn register_command(s: &TcpStream) {
-    let mut cmd = [0u8; CTRL_CMD_SIZE];
-    if (&*s).read(&mut cmd[..CTRL_CMD_SIZE - 1]).is_err() {
+/// one `recv` of at most 127 bytes, which must hold a NUL; then
+/// [`cmdservice::register_command`]. The socket is closed unless the
+/// command is queued on a device.
+fn register_command(s: TcpStream) {
+    let size = cmdservice::CMD_SIZE;
+    let mut cmd = vec![0u8; size];
+    if (&s).read(&mut cmd[..size - 1]).is_err() {
         return;
     }
-    if !cmd[..CTRL_CMD_SIZE - 1].contains(&0) {
+    if !cmd[..size - 1].contains(&0) {
         return;
     }
-    let Some(url) = cmdparse::parse_command(c_str(&cmd)) else {
-        return;
-    };
-    match lookup_handler(&url.verb, &url.scheme) {
-        None => {}
-        Some(false) => devices::dump_device_list(s),
-        Some(true) => {
-            let _ = (&*s).write(INVALID_COMMAND);
-        }
-    }
+    cmdservice::register_command(Some(s), c_str(&cmd));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn handler_table_is_case_insensitive() {
-        assert_eq!(lookup_handler(b"LIST", b"Host"), Some(false));
-        assert_eq!(lookup_handler(b"login", b"DEV"), Some(true));
-        assert_eq!(lookup_handler(b"logint", b"dev"), Some(true));
-        assert_eq!(lookup_handler(b"list", b"dev"), None);
-        assert_eq!(lookup_handler(b"run", b"file"), None);
-    }
 
     #[test]
     fn c_str_cuts_at_nul() {
