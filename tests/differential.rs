@@ -15,8 +15,12 @@ mod cli;
 mod cservice;
 #[path = "differential/daemon.rs"]
 mod daemon;
+#[path = "differential/devcmd.rs"]
+mod devcmd;
 #[path = "differential/guard.rs"]
 mod guard;
+#[path = "differential/logport.rs"]
+mod logport;
 #[path = "differential/pairing.rs"]
 mod pairing;
 #[path = "differential/pmux.rs"]
@@ -398,6 +402,18 @@ fn replace_all(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 const CLANG_GO_ONLINE: &[u8] =
     b"device_handle_t novacom_go_online(const char *, const char *, const char *, char *):";
 
+/// The reference build's libusb (1.0.30 under libusb-compat) can fail
+/// this assertion when `exit` runs while its USB scan thread is inside
+/// libusb (seen when a test stops the daemon with `version`). It is a
+/// teardown race of the reference build, not daemon output, so the line is
+/// dropped.
+const LIBUSB_EXIT_ASSERT: &[u8] =
+    b"Assertion failed: (pthread_mutex_lock(mutex) == 0), function usbi_mutex_lock, file threads_posix.h, line 46.\n";
+
+fn drop_libusb_exit_assert(stderr: &[u8]) -> Vec<u8> {
+    replace_all(stderr, LIBUSB_EXIT_ASSERT, b"")
+}
+
 /// Normalizes timestamps; for the C reference also the version string and,
 /// on macOS, the clang `__PRETTY_FUNCTION__` text and (unless invoked as
 /// `novacomd`) the executable-basename prefix of getopt diagnostics.
@@ -407,6 +423,7 @@ fn normalize(mut o: Outcome, bin: &Bin) -> Outcome {
     if bin.is_c {
         o.stdout = replace_all(&o.stdout, C_VERSION, rovacomd::cli::VERSION.as_bytes());
         if cfg!(target_os = "macos") {
+            o.stderr = drop_libusb_exit_assert(&o.stderr);
             o.stdout = replace_all(&o.stdout, CLANG_GO_ONLINE, b"novacom_go_online:");
             if !bin.alias {
                 o.stderr = replace_all(&o.stderr, b"novacomd: ", b"rovacomd: ");

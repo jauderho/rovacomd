@@ -59,15 +59,28 @@ pub struct Settings {
     pub retry_timeout: i32,
     /// C `g_usbio_retry_delay` (ms).
     pub retry_delay: i32,
+    /// Read the daemon's options again at each use (C reads its globals,
+    /// which the option port can change), instead of these values.
+    pub live: bool,
 }
 
 impl Settings {
-    /// The values from the command line.
+    /// The daemon's options, read at each use.
     pub fn from_options() -> Self {
         Self {
             recovery_timeout: server::recovery_timeout(),
             retry_timeout: server::usbio_retry_timeout(),
             retry_delay: server::usbio_retry_delay(),
+            live: true,
+        }
+    }
+
+    /// The values to use now.
+    fn current(self) -> Self {
+        if self.live {
+            Self::from_options()
+        } else {
+            self
         }
     }
 }
@@ -243,6 +256,7 @@ pub fn rx_loop<K: UsbLink, H: Host>(h: &UsbHandle<K, H::Dev>, host: &H, s: Setti
     let mut sniff = true;
     let mut errno = 0;
     while !h.is_shutdown() {
+        let s = s.current();
         let len = mtu_of(usbll.as_ref());
         let mut rc = usb_read(h, &mut buf, len, rx_timeout, host, &mut errno);
         let st = host.now();
@@ -327,7 +341,7 @@ pub fn rx_loop<K: UsbLink, H: Host>(h: &UsbHandle<K, H::Dev>, host: &H, s: Setti
                 .records()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .add(token, &nduid, link, s.recovery_timeout),
+                .add(token, &nduid, link, s.current().recovery_timeout),
             None => usbll::destroy(&link, host),
         }
     }
@@ -451,7 +465,7 @@ pub fn tx_loop<K: UsbLink, H: Host>(h: &UsbHandle<K, H::Dev>, host: &H, s: Setti
                 let (count, et) = retry(
                     h,
                     host,
-                    s,
+                    s.current(),
                     st,
                     &mut time_used,
                     &mut rc,
@@ -488,7 +502,7 @@ pub fn tx_loop<K: UsbLink, H: Host>(h: &UsbHandle<K, H::Dev>, host: &H, s: Setti
 
 /// C `novacom_usb_transport_start`: the find-and-attach thread, scanning
 /// once a second for ever. The `-t`, `-e` and `-s` values are read at each
-/// attach (C reads the globals, which the option port can change).
+/// use (C reads the globals, which the option port can change).
 ///
 /// Intentional change: C `novacom_usb_transport_init` (Linux) exits with
 /// `need to run as super user to access usb` when not root; there is no
@@ -593,6 +607,7 @@ mod tests {
         recovery_timeout: 5,
         retry_timeout: 100,
         retry_delay: 50,
+        live: false,
     };
 
     /// Scripted bulk endpoints: reads return the queued packets, then fail
@@ -669,6 +684,7 @@ mod tests {
             recovery_timeout: 5,
             retry_timeout: 120,
             retry_delay: 50,
+            live: false,
         };
         let mut used = 0;
         for want in [50, 100, 120, 120] {

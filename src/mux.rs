@@ -15,11 +15,11 @@
 //! right after it is released (they only wake other threads).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::bufq::BufQueue;
-use crate::{cmdparse, log};
+use crate::{cmdparse, devcmd, log};
 
 pub const PMUX_MAGIC: u32 = 0x706d_7578;
 pub const PMUX_VERSION: u8 = 3;
@@ -73,7 +73,7 @@ pub(crate) fn u32_at(buf: &[u8], at: usize) -> u32 {
 }
 
 /// `u32` as C `%d` prints it.
-fn c_int(v: u32) -> i32 {
+pub(crate) fn c_int(v: u32) -> i32 {
     i32::from_ne_bytes(v.to_ne_bytes())
 }
 
@@ -139,6 +139,10 @@ pub fn encode_control(op: u32, channel: u32) -> [u8; CONTROL_LEN] {
 /// the device acknowledged it or the channel went away.
 pub type Notify = Box<dyn FnOnce() + Send>;
 
+/// Work a channel callback starts once the mux is released (C creates the
+/// thread inside the callback; it runs when the caller drops the lock).
+pub type Spawn = Box<dyn FnOnce(Arc<Device>) + Send>;
+
 /// Receiver of a client channel (C `socketchan_read_callback`). `data` is
 /// `None` when the channel shuts down (C `err = -1`). A negative return
 /// value withholds the ack, so the device retransmits.
@@ -178,6 +182,8 @@ struct Channel {
     rx_sequence: u32,
     reader: Option<Reader>,
     has_pending_ack: bool,
+    /// C `close_callbacks`: fired when the channel shuts down.
+    close_callbacks: Vec<(u64, Notify)>,
 }
 
 impl Channel {
@@ -193,6 +199,7 @@ impl Channel {
             rx_sequence: 0,
             reader: None,
             has_pending_ack: false,
+            close_callbacks: Vec::new(),
         }
     }
 }
@@ -221,6 +228,10 @@ pub struct Mux {
     wake: bool,
     /// Callbacks due to run once the caller releases the mux.
     fired: Vec<Notify>,
+    /// Work due to start once the caller releases the mux.
+    spawns: Vec<Spawn>,
+    /// Identity of the next close callback.
+    next_close_id: u64,
 }
 
 impl Default for Mux {
@@ -239,6 +250,8 @@ impl Mux {
             next_temp_channel: CHANNEL_HOST_BASE,
             wake: false,
             fired: Vec::new(),
+            spawns: Vec::new(),
+            next_close_id: 0,
         };
         m.create_channel(CHANNEL_CONTROL, false, true);
         let _ = m.set_reader(CHANNEL_CONTROL, Some(Reader::Control));
@@ -258,6 +271,16 @@ impl Mux {
     /// the mux.
     pub fn take_fired(&mut self) -> Vec<Notify> {
         std::mem::take(&mut self.fired)
+    }
+
+    /// Work that became due; the caller starts it after releasing the mux.
+    pub fn take_spawns(&mut self) -> Vec<Spawn> {
+        std::mem::take(&mut self.spawns)
+    }
+
+    /// Queues `f` to start once the caller releases the mux.
+    pub(crate) fn spawn(&mut self, f: Spawn) {
+        self.spawns.push(f);
     }
 
     fn find(&self, num: u32) -> Option<usize> {
@@ -296,6 +319,33 @@ impl Mux {
     pub fn set_reader(&mut self, chan: u32, reader: Option<Reader>) -> Result<(), NoChannel> {
         let i = self.find(chan).ok_or(NoChannel)?;
         self.channels[i].reader = reader;
+        Ok(())
+    }
+
+    /// C `novacom_set_closechannel_callback`: `done` fires when the channel
+    /// shuts down. Returns an id for [`Mux::clear_close_callback`]. `Err`
+    /// (C -1) if there is no such channel or it is closing.
+    pub fn set_close_callback(&mut self, chan: u32, done: Notify) -> Result<u64, NoChannel> {
+        let i = self.find(chan).ok_or(NoChannel)?;
+        if self.channels[i].closing {
+            return Err(NoChannel);
+        }
+        let id = self.next_close_id;
+        self.next_close_id += 1;
+        self.channels[i].close_callbacks.push((id, done));
+        Ok(id)
+    }
+
+    /// C `novacom_clear_closechannel_callback`: the callback is dropped
+    /// without running. `Err` (C -1) if there is no such channel or it is
+    /// closing (the callback then still fires).
+    pub fn clear_close_callback(&mut self, chan: u32, id: u64) -> Result<(), NoChannel> {
+        let i = self.find(chan).ok_or(NoChannel)?;
+        let c = &mut self.channels[i];
+        if c.closing {
+            return Err(NoChannel);
+        }
+        c.close_callbacks.retain(|(k, _)| *k != id);
         Ok(())
     }
 
@@ -360,6 +410,8 @@ impl Mux {
             let _ = self.send_control(OP_CLOSE, c.num, None);
         }
         self.fired.extend(c.tx.destroy());
+        self.fired
+            .extend(c.close_callbacks.into_iter().map(|(_, n)| n));
         if let Some(r) = c.reader {
             self.call_reader(&r, c.num, None);
         }
@@ -369,7 +421,8 @@ impl Mux {
     pub fn go_offline(&mut self) {
         self.online = false;
         self.wake = true;
-        while !self.channels.is_empty() {
+        while let Some(c) = self.channels.first() {
+            muxtrace(&format!("shutting down channel {}\n", c_int(c.num)));
             self.shutdown_channel(0, false);
         }
     }
@@ -391,44 +444,41 @@ impl Mux {
             return 0;
         }
         let (op, chan) = (u32_at(data, 0), u32_at(data, 4));
+        let name = match op {
+            OP_CHANNEL_CLOSED => "CONTROL_CHANNEL_CLOSED",
+            OP_OPEN => "CONTROL_OPEN",
+            OP_OPEN_COMMAND => "CONTROL_OPEN_COMMAND",
+            OP_CLOSE => "CONTROL_CLOSE",
+            _ => return 0,
+        };
+        muxtrace(&format!("{name}: {}\n", c_int(chan)));
         match op {
-            OP_CHANNEL_CLOSED | OP_CLOSE => {
-                if let Some(i) = self.find(chan) {
-                    self.shutdown_channel(i, false);
-                }
-            }
             OP_OPEN => {
                 self.create_channel(chan, false, false);
             }
             OP_OPEN_COMMAND => {
                 self.create_channel(chan, true, false);
             }
-            _ => {}
+            _ => {
+                if let Some(i) = self.find(chan) {
+                    self.shutdown_channel(i, false);
+                }
+            }
         }
         0
     }
 
-    /// C `novacom_handle_command_fromclient` on the host (no auth check).
-    ///
-    /// Deferred to slice 6: the `get file`, `put file` and
-    /// `connect tcp-port` handlers (D1). For these the handler is removed
-    /// as in C, but nothing is started, so later data on the channel is
-    /// not acknowledged.
+    /// C `novacom_handle_command_fromclient` on the host (no auth check):
+    /// the `get file`, `put file` and `connect tcp-port` handlers of
+    /// [`devcmd`] (D1, kept as in C).
     fn command_read(&mut self, chan: u32, data: &[u8]) -> i32 {
         let Some(url) = cmdparse::parse_command(data) else {
             let _ = self.write(chan, UNRECOGNIZED, None);
             return 0;
         };
+        // Removed up front "so that fast clients don't overrun us".
         let _ = self.set_reader(chan, None);
-        const HANDLERS: [(&[u8], &[u8]); 3] = [
-            (b"get", b"file"),
-            (b"put", b"file"),
-            (b"connect", b"tcp-port"),
-        ];
-        let handled = HANDLERS
-            .iter()
-            .any(|(v, s)| url.verb.eq_ignore_ascii_case(v) && url.scheme.eq_ignore_ascii_case(s));
-        if !handled {
+        if !devcmd::start(self, chan, &url) {
             let _ = self.write(chan, UNRECOGNIZED, None);
             let _ = self.set_reader(chan, Some(Reader::Command));
         }
@@ -471,6 +521,8 @@ impl Mux {
                 if shutdown {
                     self.shutdown_channel(i, true);
                 }
+            } else {
+                log::trace(seq_line("Out of sequence ACK", c, &h).as_bytes());
             }
             return;
         }
@@ -496,9 +548,19 @@ impl Mux {
             do_ack = true;
         } else if let Some(reader) = c.reader.clone() {
             if h.sequence == c.rx_sequence {
+                log::trace(seq_line("RE-ACK", c, &h).as_bytes());
                 do_ack = true;
             } else if h.sequence == c.rx_sequence.wrapping_add(1) {
-                if h.crc == 0 || adler(data) == h.crc {
+                let crc = if h.crc == 0 { 0 } else { adler(data) };
+                if crc != h.crc {
+                    log::trace(
+                        format!(
+                            "novacom_process_packet:462: *** CHECKSUM MISMATCH *** (that's a bad thing): header->crc({:08x}), crc({crc:08x})\n",
+                            h.crc
+                        )
+                        .as_bytes(),
+                    );
+                } else {
                     let accepted = self.call_reader(&reader, num, Some(data)) >= 0;
                     // The callback may have shut the channel down (a
                     // CLOSE for channel 1 itself). C then writes to the
@@ -510,15 +572,10 @@ impl Mux {
                 }
             } else {
                 log::error(
-                    format!(
-                        "[{}] RX PKT OUT OF SEQUENCE (this is a very weird and bad thing): h->seq: {}, c->rx_seq: {}, h->flags: {}, h->channel: {},c->last_tx: {}, c->acked_tx: {}\n",
-                        c_int(num),
-                        c_int(h.sequence),
-                        c_int(c.rx_sequence),
-                        h.flags,
-                        c_int(h.channel),
-                        c_int(c.last_tx_sequence),
-                        c_int(c.acked_tx_sequence),
+                    seq_line(
+                        "RX PKT OUT OF SEQUENCE (this is a very weird and bad thing)",
+                        c,
+                        &h,
                     )
                     .as_bytes(),
                 );
@@ -606,6 +663,25 @@ impl Mux {
     }
 }
 
+/// `TRACEL(LOG_MUXTRACE, ...)`.
+fn muxtrace(line: &str) {
+    log::log(log::LOG_MUXTRACE, line.as_bytes());
+}
+
+/// The C sequence diagnostics of `novacom_process_packet`.
+fn seq_line(what: &str, c: &Channel, h: &Header) -> String {
+    format!(
+        "[{}] {what}: h->seq: {}, c->rx_seq: {}, h->flags: {}, h->channel: {},c->last_tx: {}, c->acked_tx: {}\n",
+        c_int(c.num),
+        c_int(h.sequence),
+        c_int(c.rx_sequence),
+        h.flags,
+        c_int(h.channel),
+        c_int(c.last_tx_sequence),
+        c_int(c.acked_tx_sequence),
+    )
+}
+
 /// One-shot event with a waiter (C `platform_event_t` used by
 /// `novacom_write_channel_sync`).
 #[derive(Default)]
@@ -635,6 +711,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// A shared mux (C `device_handle_t`).
 pub struct Device {
     id: u64,
+    /// This device, for work started by channel callbacks.
+    me: Weak<Device>,
     mux: Mutex<Mux>,
     /// Signalled with [`Mux::wake_pending`] (C `wake_tx_event`).
     wake: Condvar,
@@ -643,8 +721,9 @@ pub struct Device {
 impl Device {
     /// A new online mux (C `novacom_go_online` before registration).
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            me: me.clone(),
             mux: Mutex::new(Mux::new()),
             wake: Condvar::new(),
         })
@@ -659,19 +738,24 @@ impl Device {
         self.mux.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Runs `f` on the locked mux, then signals the transmitter if needed
-    /// and runs the callbacks that became due.
+    /// Runs `f` on the locked mux, then signals the transmitter if needed,
+    /// runs the callbacks that became due and starts due work.
     pub fn with<R>(&self, f: impl FnOnce(&mut Mux) -> R) -> R {
-        let (r, fired) = {
+        let (r, fired, spawns) = {
             let mut m = self.lock();
             let r = f(&mut m);
             if m.wake_pending() {
                 self.wake.notify_all();
             }
-            (r, m.take_fired())
+            (r, m.take_fired(), m.take_spawns())
         };
         for n in fired {
             n();
+        }
+        if let Some(me) = self.me.upgrade() {
+            for s in spawns {
+                s(Arc::clone(&me));
+            }
         }
         r
     }
@@ -1199,6 +1283,45 @@ mod tests {
         assert!(!m.is_online());
         assert!(!m.create_channel(0x1003, false, false));
         assert_eq!(m.write(CHANNEL_CONTROL, b"x", None), Err(NoChannel));
+    }
+
+    #[test]
+    fn close_callbacks_fire_on_shutdown_unless_cleared() {
+        let mut m = Mux::new();
+        assert!(m.create_channel(0x1000, false, false));
+        let (kept, notify) = counter();
+        let (cleared, notify2) = counter();
+        m.set_close_callback(0x1000, notify).unwrap();
+        let id = m.set_close_callback(0x1000, notify2).unwrap();
+        m.clear_close_callback(0x1000, id).unwrap();
+        assert!(m.set_close_callback(0x2000, Box::new(|| {})).is_err());
+        m.write(0x1000, b"x", None).unwrap();
+        m.close_channel(0x1000).unwrap();
+        // Closing: no new callbacks, none cleared.
+        assert!(m.set_close_callback(0x1000, Box::new(|| {})).is_err());
+        assert!(m.clear_close_callback(0x1000, 0).is_err());
+        run_fired(&mut m);
+        assert_eq!(kept.load(Ordering::Relaxed), 0);
+        m.go_offline();
+        run_fired(&mut m);
+        assert_eq!(kept.load(Ordering::Relaxed), 1);
+        assert_eq!(cleared.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn device_starts_spawned_work_after_release() {
+        let dev = Device::new();
+        let ran = Arc::new(AtomicI32::new(0));
+        let r2 = Arc::clone(&ran);
+        dev.with(|m| {
+            m.spawn(Box::new(move |d| {
+                // The mux is free again.
+                d.with(|m| assert!(m.is_online()));
+                r2.store(1, Ordering::Relaxed);
+            }));
+            assert_eq!(ran.load(Ordering::Relaxed), 0);
+        });
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
     }
 
     #[test]

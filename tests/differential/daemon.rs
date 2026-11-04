@@ -662,3 +662,109 @@ fn reaper_kills_marked_processes() {
     assert_eq!(status.signal(), Some(9));
     assert_eq!(marked_pids(&mark), Vec::<u32>::new());
 }
+
+/// Options injected through the option port after startup: none of these
+/// prints anything (except the range error) or stops the daemon; `-t` with
+/// no value (`l1 = 0`) gets an empty string.
+#[test]
+fn option_port_injection_keeps_serving() {
+    let out = differential(|bin| {
+        let d = start(bin, &[]);
+        for (name, val) in [
+            (&b"daemonize"[..], None),
+            (b"no-cpuaffinity", None),
+            (b"ioretry_timeout", Some(&b"300"[..])),
+            (b"ioretry_delay", Some(b"20")),
+            (b"recoverytimeout", None),
+        ] {
+            assert_eq!(send_opt(name, val), b"");
+        }
+        let _a = FakeDevice::connect(A);
+        let list = mask_ports(&wait_list(|l| lines(l) == 1));
+        (list, d.stop())
+    });
+    let (list, o) = out;
+    assert_eq!(list, [&b"<P> "[..], A, b" tcp emulator\n"].concat());
+    assert_eq!(o.status, "exit 1");
+    assert_eq!(
+        o.stderr,
+        ts_lines(&[b"Invalid timeout out of range(2~5 seconds):  "])
+    );
+}
+
+/// `bind-all-interfaces` through the option port: device listen sockets
+/// made afterwards bind all interfaces; the fixed ones keep their address.
+/// Linux only (macOS prompts for a wildcard listener).
+#[cfg(target_os = "linux")]
+#[test]
+fn option_port_bind_all_affects_new_devices() {
+    let ls = differential(|bin| {
+        let d = start(bin, &[]);
+        assert_eq!(send_opt(b"bind-all-interfaces", None), b"");
+        let _a = FakeDevice::connect(A);
+        wait_list(|l| lines(l) == 1);
+        listeners(&d)
+    });
+    let (any, lo) = ("0.0.0.0", "127.0.0.1");
+    assert_eq!(
+        ls,
+        set(&[
+            (any, 0),
+            (lo, 6968),
+            (lo, 6969),
+            (lo, 6970),
+            (lo, 6971),
+            (lo, 12311),
+            (lo, 64022)
+        ])
+    );
+}
+
+/// Waits until port 6968 answers (a daemonized child has no handle here).
+fn wait_port_6968() {
+    let deadline = Instant::now() + TIMEOUT;
+    while TcpStream::connect((LOCALHOST, 6968)).is_err() {
+        assert!(Instant::now() < deadline, "daemon not ready");
+        std::thread::sleep(POLL);
+    }
+}
+
+/// `-d`: the child sets umask 0, so a device's `put` creates mode 0775
+/// whatever the caller's umask; the child serves until stopped through the
+/// option port. Paths are absolute, inside a temporary directory.
+#[test]
+fn daemonized_child_serves_put_with_umask_zero() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = differential(|bin| {
+        let dir = super::devcmd::TempDir::new("daemon");
+        let url = dir.url("dst");
+        let mark = format!("{}-put-{}", std::process::id(), bin.is_c);
+        let operand = format!("{DAEMONIZE_MARK}{mark}");
+        let d = Daemon::spawn(bin, &["-d", &operand]);
+        let _reaper = Reaper(mark.clone());
+        let parent = d.wait_exit();
+        assert_eq!(parent.status, "exit 0");
+        wait_port_6968();
+        let dev = super::pmux::Pmux::connect(A);
+        wait_list(|l| lines(l) == 1);
+        const CH: u32 = 0x8000_0001;
+        dev.send_control(super::pmux::OPEN_COMMAND, CH);
+        assert!(dev.send(CH, format!("put file://{url}\n").as_bytes()));
+        assert_eq!(dev.wait_line(CH), b"ok 0\n");
+        assert!(dev.send(CH, &super::pmux::stream_packet(super::pmux::S_DATA, b"x")));
+        assert!(dev.send(CH, &super::pmux::oob(super::pmux::OOB_EOF, 0)));
+        dev.wait_control(super::pmux::CLOSE, CH);
+        drop(dev);
+        let _ = send_opt(b"version", None);
+        let deadline = Instant::now() + TIMEOUT;
+        while !marked_pids(&mark).is_empty() {
+            assert!(Instant::now() < deadline, "daemonized child still running");
+            std::thread::sleep(POLL);
+        }
+        let meta = std::fs::metadata(dir.path("dst")).expect("stat");
+        assert_eq!(std::fs::read(dir.path("dst")).expect("read"), b"x");
+        assert_eq!(dir.entries().len(), 1);
+        meta.permissions().mode() & 0o7777
+    });
+    assert_eq!(mode, 0o775);
+}

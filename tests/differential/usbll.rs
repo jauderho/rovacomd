@@ -1190,6 +1190,7 @@ fn run_rust_threads(steps: &[TStep]) -> Vec<String> {
         recovery_timeout: 5,
         retry_timeout: 100,
         retry_delay: 50,
+        live: false,
     };
     for st in steps {
         match st {

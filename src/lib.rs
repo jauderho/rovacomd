@@ -5,6 +5,7 @@ pub mod bufq;
 pub mod cli;
 pub mod cmdparse;
 pub mod cmdservice;
+pub mod devcmd;
 pub mod devices;
 pub mod inet;
 pub mod log;

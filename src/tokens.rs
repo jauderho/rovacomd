@@ -14,7 +14,7 @@ use std::path::Path;
 
 use sha1::{Digest, Sha1};
 
-use crate::sys;
+use crate::{log, sys};
 
 /// C `char path[128]`.
 const PATH_SIZE: usize = 128;
@@ -52,7 +52,13 @@ impl TokenStore {
     fn dir(&self) -> Option<Vec<u8>> {
         let home = match &self.home {
             Some(h) => h.clone(),
-            None => sys::home_dir()?,
+            None => match sys::home_dir() {
+                Some(h) => h,
+                None => {
+                    log::trace(b"tokenstorage_path:57: unable to recover home directory\n");
+                    return None;
+                }
+            },
         };
         let mut path = [&home[..], b"/.nova/"].concat();
         path.truncate(PATH_SIZE - 1);
@@ -60,7 +66,10 @@ impl TokenStore {
             .mode(0o700)
             .create(OsStr::from_bytes(&path))
         {
-            Err(e) if e.kind() != ErrorKind::AlreadyExists => None,
+            Err(e) if e.kind() != ErrorKind::AlreadyExists => {
+                log::trace(b"tokenstorage_path:67: unable to create .nova directory\n");
+                None
+            }
             _ => Some(path),
         }
     }
@@ -77,9 +86,28 @@ impl TokenStore {
     /// 0666 less the umask); a failed write removes it.
     pub fn store(&self, file: &[u8], data: &[u8]) -> io::Result<()> {
         let path = self.file_path(file, PATH_SIZE - 1)?;
+        let shown = path_trace(&path);
         let path = Path::new(OsStr::from_bytes(&path));
-        let written = File::create(path)?.write_all(data);
+        let f = File::create(path).inspect_err(|_| {
+            log::trace(
+                &[
+                    &b"tokenstorage_store:94: unable to create '"[..],
+                    &shown,
+                    b"' file\n",
+                ]
+                .concat(),
+            );
+        })?;
+        let written = (&f).write_all(data);
         if written.is_err() {
+            log::trace(
+                &[
+                    &b"tokenstorage_store:101: unable to write to '"[..],
+                    &shown,
+                    b"' file: remove...\n",
+                ]
+                .concat(),
+            );
             let _ = fs::remove_file(path);
         }
         written
@@ -105,13 +133,32 @@ impl TokenStore {
     /// token file, else `None`.
     pub fn read(&self, file: &[u8], len: usize) -> Option<Vec<u8>> {
         let path = self.file_path(file, PATH_SIZE).ok()?;
+        let shown = path_trace(&path);
+        let Ok(f) = File::open(OsStr::from_bytes(&path)) else {
+            log::trace(
+                &[
+                    &b"tokenstorage_read:151: unable to open '"[..],
+                    &shown,
+                    b"' file\n",
+                ]
+                .concat(),
+            );
+            return None;
+        };
         let mut buf = Vec::with_capacity(len);
-        File::open(OsStr::from_bytes(&path))
-            .ok()?
-            .take(len as u64)
-            .read_to_end(&mut buf)
-            .ok()?;
-        (buf.len() == len).then_some(buf)
+        let _ = f.take(len as u64).read_to_end(&mut buf);
+        if buf.len() != len {
+            log::trace(
+                &[
+                    &b"tokenstorage_read:157: unable to read data: '"[..],
+                    &shown,
+                    b"' file...\n",
+                ]
+                .concat(),
+            );
+            return None;
+        }
+        Some(buf)
     }
 
     /// C `tokenstorage_readhash`: `hex(SHA1(token[0..256] ‖ ssid))` for a
@@ -123,6 +170,11 @@ impl TokenStore {
         let token = self.read(file, AUTHTOKEN_LEN)?;
         Some(sha1_hex(&[&token[..], ssid].concat()))
     }
+}
+
+/// A path as C `%s` prints it (up to the first NUL).
+fn path_trace(path: &[u8]) -> Vec<u8> {
+    path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())].to_vec()
 }
 
 /// C `SHA1Result` `Message_Digest_Str`: lowercase hex.

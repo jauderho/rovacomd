@@ -12,13 +12,15 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::net::TcpStream;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::cmdparse::{self, CommandUrl};
-use crate::devices;
 use crate::mux::{self, CHANNEL_CMDSERVICE, Mux};
 use crate::tokens::{AUTHSESSION_LEN, TokenStore};
 use crate::wirebuf::{Reader, Writer};
+use crate::{devices, log};
 
 /// C `NOVACOMDMSG_REPLY_OK`, NUL included.
 pub const REPLY_OK: &[u8] = b"ok 0\n\0";
@@ -63,14 +65,32 @@ pub fn lookup_handler(verb: &[u8], scheme: &[u8]) -> Option<bool> {
 struct SocketCmd {
     socket: Option<TcpStream>,
     url: CommandUrl,
+    /// C `cmd_id`: the device's count of queued commands.
+    id: i32,
+    /// Address of the device (C `device_handle`), for the trace line.
+    device: usize,
 }
 
-/// C `destroy_socketcmd` after one `send` of `reply` (errors ignored):
-/// the client socket is closed.
+/// C `destroy_socketcmd`: the client socket is closed.
+fn destroy(cmd: SocketCmd) {
+    log::trace(
+        format!(
+            "destroy_socketcmd:1437: socketcmd::destroy: {:p}, socket {}, service_num {}, device {:#x}\n",
+            &raw const cmd,
+            cmd.socket.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+            cmd.id,
+            cmd.device,
+        )
+        .as_bytes(),
+    );
+}
+
+/// C `destroy_socketcmd` after one `send` of `reply` (errors ignored).
 fn finish(cmd: SocketCmd, reply: &[u8]) {
     if let Some(s) = &cmd.socket {
         let _ = (&*s).write(reply);
     }
+    destroy(cmd);
 }
 
 /// The service state of a device with a session id (C `active_device`
@@ -81,6 +101,8 @@ pub struct Service {
     tokens: TokenStore,
     /// Invariant: the head, if any, has been sent and awaits its reply.
     queue: Mutex<VecDeque<SocketCmd>>,
+    /// C `cmd_serviced`: commands queued so far.
+    serviced: AtomicI32,
 }
 
 impl Service {
@@ -90,6 +112,7 @@ impl Service {
             sessionid: sessionid.to_vec(),
             tokens,
             queue: Mutex::new(VecDeque::new()),
+            serviced: AtomicI32::new(0),
         }
     }
 
@@ -172,7 +195,15 @@ impl Service {
                 None => false,
                 // C returns the blob length 0: success, nothing stored.
                 Some([]) => true,
-                Some(token) => self.tokens.store(&self.devid, token).is_ok(),
+                Some(token) => {
+                    let stored = self.tokens.store(&self.devid, token).is_ok();
+                    if !stored {
+                        log::trace(
+                            b"novacom_service_reply:445: Unable to save token in local store\n",
+                        );
+                    }
+                    stored
+                }
             },
             _ => false,
         }
@@ -196,10 +227,16 @@ impl Service {
 
     /// The queueing part of C `novacom_register_command`: the command is
     /// appended; if the queue was empty it is processed at once.
-    fn enqueue(&self, m: &mut Mux, socket: Option<TcpStream>, url: CommandUrl) {
+    fn enqueue(&self, m: &mut Mux, device: usize, socket: Option<TcpStream>, url: CommandUrl) {
         let mut q = self.lock();
         let first = q.is_empty();
-        q.push_back(SocketCmd { socket, url });
+        let id = self.serviced.fetch_add(1, Ordering::Relaxed);
+        q.push_back(SocketCmd {
+            socket,
+            url,
+            id,
+            device,
+        });
         if first {
             self.process_queue(m, &mut q);
         }
@@ -212,7 +249,11 @@ impl Service {
     /// released). Returns `true` if there is such a command.
     pub fn drop_pending(&self) -> bool {
         let mut q = self.lock();
-        q.truncate(1);
+        let keep = q.len().min(1);
+        let rest: Vec<SocketCmd> = q.drain(keep..).collect();
+        for cmd in rest {
+            destroy(cmd);
+        }
         !q.is_empty()
     }
 }
@@ -270,7 +311,8 @@ pub fn register_command(socket: Option<TcpStream>, cmd: &[u8]) {
         }
         return;
     };
-    dev.with(|m| svc.enqueue(m, socket, url));
+    let device = Arc::as_ptr(&dev) as usize;
+    dev.with(|m| svc.enqueue(m, device, socket, url));
 }
 
 /// C `novacom_deviceinit_thread`: opens channel 0x50 (waiting for the
@@ -278,13 +320,26 @@ pub fn register_command(socket: Option<TcpStream>, cmd: &[u8]) {
 /// device, queues `logint dev://<nduid> <hash>` without a client.
 pub fn device_init(dev: &mux::Device, svc: Arc<Service>) {
     if dev.open_channel(CHANNEL_CMDSERVICE, true) < 0 {
+        log::trace(b"novacom_deviceinit_thread:1146: Unable to create channel: rc(-1)\n");
         return;
     }
     let reader: Arc<dyn mux::ServiceReader> = svc.clone();
-    if dev
-        .with(|m| m.set_reader(CHANNEL_CMDSERVICE, Some(mux::Reader::Service(reader))))
-        .is_err()
-    {
+    let set = dev.with(|m| m.set_reader(CHANNEL_CMDSERVICE, Some(mux::Reader::Service(reader))));
+    if set.is_err() {
+        log::trace(b"novacom_deviceinit_thread:1142: hit create channel/device going away race\n");
+    }
+    // C: a zeroed `socketchan` (socket 0) for channel 0x50, -1 after a
+    // failure.
+    log::trace(
+        format!(
+            "novacom_deviceinit_thread:1144: socketchan::created: {:p}, socket 0, novacom {}, device {:p}\n",
+            Arc::as_ptr(&svc),
+            if set.is_ok() { CHANNEL_CMDSERVICE as i32 } else { -1 },
+            &raw const *dev,
+        )
+        .as_bytes(),
+    );
+    if set.is_err() {
         return;
     }
     let Some(hash) = svc.tokens.read_hash(&svc.devid, &svc.sessionid) else {
@@ -362,7 +417,7 @@ mod tests {
         fn command(&mut self, cmd: &str) -> TcpStream {
             let (c, s) = Self::client();
             let url = cmdparse::parse_command(cmd.as_bytes()).unwrap();
-            self.svc.enqueue(&mut self.mux, Some(s), url);
+            self.svc.enqueue(&mut self.mux, 0, Some(s), url);
             c
         }
 

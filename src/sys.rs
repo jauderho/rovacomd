@@ -1,8 +1,8 @@
 //! Unix calls the C daemon makes that std does not expose: `time` /
 //! `localtime_r`, `srand` / `rand`, `isatty`, raw `write` on the standard
 //! fds, `poll` (in place of `select`), the `-d` steps (`fork`, `umask`,
-//! `setsid`, closing fds 0-2), `getpwuid_r`, `getaddrinfo`, `TCP_QUICKACK`
-//! and syslog.
+//! `setsid`, closing fds 0-2), `getpwuid_r`, `getaddrinfo`, `strerror`,
+//! `TCP_QUICKACK` and syslog.
 //!
 //! This is the only module with `unsafe` code.
 
@@ -230,6 +230,22 @@ pub fn resolve_first(host: &[u8], serv: &[u8]) -> Option<SocketAddr> {
     addr
 }
 
+/// C `strerror(errnum)`: the libc message text (through the reentrant
+/// XSI `strerror_r`).
+pub fn strerror(errnum: i32) -> Vec<u8> {
+    let mut buf = vec![0 as libc::c_char; 256];
+    // SAFETY: `buf` is a live array of `buf.len()` chars; `strerror_r`
+    // writes a NUL-terminated message of at most that size into it.
+    let rc = unsafe { libc::strerror_r(errnum, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return format!("Unknown error {errnum}").into_bytes();
+    }
+    // SAFETY: on success `buf` holds a NUL-terminated string.
+    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_bytes()
+        .to_vec()
+}
+
 /// C `setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &1)`; errors ignored.
 #[cfg(target_os = "linux")]
 pub fn tcp_quickack(sock: &std::net::TcpStream) {
@@ -292,6 +308,12 @@ mod tests {
         );
         assert_eq!(resolve_first(b"127.0.0.1", b"nosuchservice"), None);
         assert_eq!(resolve_first(b"127.0.0.1", b"69\x0069"), None);
+    }
+
+    #[test]
+    fn strerror_texts() {
+        assert_eq!(strerror(libc::EPIPE), b"Broken pipe");
+        assert_eq!(strerror(libc::ENOENT), b"No such file or directory");
     }
 
     #[test]

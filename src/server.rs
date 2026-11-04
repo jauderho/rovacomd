@@ -270,14 +270,17 @@ impl mux::ClientReader for ClientChan {
     /// C `socketchan_read_callback`: one non-blocking `send` to the client.
     /// A short or refused send withholds the ack, so the device
     /// retransmits; `partial_pos` remembers what was sent.
-    fn read(&self, _channel: u32, data: Option<&[u8]>) -> i32 {
+    fn read(&self, channel: u32, data: Option<&[u8]>) -> i32 {
+        let channel = mux::c_int(channel);
         let Some(buf) = data else {
+            log::trace(format!("novacom channel {channel} closed\n").as_bytes());
             self.close.store(true, Ordering::SeqCst);
             self.channel.store(NO_CHANNEL, Ordering::SeqCst);
             unblock_main_loop();
             return 0;
         };
         if self.close.load(Ordering::SeqCst) {
+            log::trace(format!("novacom channel {channel} closing\n").as_bytes());
             unblock_main_loop();
             return 0;
         }
@@ -302,7 +305,19 @@ impl mux::ClientReader for ClientChan {
                 -1
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => -1,
-            _ => {
+            r => {
+                let (written, errno) = match r {
+                    Err(e) => (-1, e.raw_os_error().unwrap_or(0)),
+                    Ok(_) => (0, 0),
+                };
+                log::trace(
+                    format!(
+                        "novacom channel {channel} error: {written} {errno} {} {}\n",
+                        buf.len() as i32,
+                        *pos as i32
+                    )
+                    .as_bytes(),
+                );
                 self.close.store(true, Ordering::SeqCst);
                 unblock_main_loop();
                 -1
@@ -327,6 +342,7 @@ fn wake_main_loop() -> mux::Notify {
 /// command channel is opened, blocking the main loop until the device
 /// acknowledges (D9).
 fn register_client(list: &mut Vec<SocketChan>, device: &Arc<mux::Device>, stream: TcpStream) {
+    let dev_ptr = Arc::as_ptr(device);
     let chan = Arc::new(ClientChan {
         stream,
         close: AtomicBool::new(false),
@@ -341,9 +357,16 @@ fn register_client(list: &mut Vec<SocketChan>, device: &Arc<mux::Device>, stream
             tx_squelch: false,
         },
     );
+    log::trace(
+        format!("novacom_register_client:512: Opening temp channel, device {dev_ptr:p}\n")
+            .as_bytes(),
+    );
     let (num, rc) = device.open_temp_channel();
     chan.channel.store(num, Ordering::SeqCst);
     if rc < 0 {
+        log::trace(
+            format!("novacom_register_client:527: Unable to create channel: rc({rc})\n").as_bytes(),
+        );
         chan.channel.store(NO_CHANNEL, Ordering::SeqCst);
         return;
     }
@@ -355,7 +378,17 @@ fn register_client(list: &mut Vec<SocketChan>, device: &Arc<mux::Device>, stream
         // The device went away during the open.
         chan.channel.store(NO_CHANNEL, Ordering::SeqCst);
         chan.close.store(true, Ordering::SeqCst);
+        log::trace(b"novacom_register_client:523: hit create channel/device going away race\n");
     }
+    log::trace(
+        format!(
+            "novacom_register_client:525: socketchan::created: {:p}, socket {}, novacom {}, device {dev_ptr:p}\n",
+            Arc::as_ptr(&chan),
+            chan.stream.as_raw_fd(),
+            mux::c_int(chan.channel.load(Ordering::SeqCst)),
+        )
+        .as_bytes(),
+    );
 }
 
 /// C `destroy_socketchan`. As in C, a channel of `(uint32_t)-1` is also
@@ -368,6 +401,16 @@ fn destroy_socketchan(sc: SocketChan) {
             let _ = m.close_channel(ch);
         });
     }
+    log::trace(
+        format!(
+            "destroy_socketchan:256: socketchan::destroy: {:p}, socket {}, novacom {}, device {:p}\n",
+            Arc::as_ptr(&sc.chan),
+            sc.chan.stream.as_raw_fd(),
+            mux::c_int(sc.chan.channel.load(Ordering::SeqCst)),
+            Arc::as_ptr(&sc.device),
+        )
+        .as_bytes(),
+    );
     let _ = sc.chan.stream.shutdown(Shutdown::Both);
     // The socket closes with the last reference, which is this one.
 }
@@ -478,7 +521,12 @@ fn main_loop(l: &Listeners) -> ! {
             if !is_ready(*at) {
                 continue;
             }
-            if let Some(Ok((s, _))) = d.listener.as_ref().map(TcpListener::accept) {
+            let Some(accepted) = d.listener.as_ref().map(TcpListener::accept) else {
+                continue;
+            };
+            let fd = accepted.as_ref().map_or(-1, |(s, _)| s.as_raw_fd());
+            log::trace(format!("data socket {fd}\n").as_bytes());
+            if let Ok((s, _)) = accepted {
                 // "Set non-blocking or novacomd will drop offline if the
                 // socket fills up."
                 let _ = s.set_nonblocking(true);
@@ -508,18 +556,42 @@ fn main_loop(l: &Listeners) -> ! {
 /// C retries a `recv` that would block, logging each try (D29); after a
 /// ready `poll` that cannot happen, so here such a pass reads nothing.
 fn relay_from_client(sc: &mut SocketChan, sdata: &mut [u8]) {
+    let fd = sc.chan.stream.as_raw_fd();
     let n = match (&sc.chan.stream).read(sdata) {
-        Ok(0) => {
-            sc.chan.close.store(true, Ordering::SeqCst);
-            return;
-        }
-        Ok(n) => n,
+        Ok(n) if n > 0 => n,
         Err(e) if e.kind() == ErrorKind::WouldBlock => return,
-        Err(_) => {
+        r => {
+            // C prints `errno` also at EOF, where it is whatever an
+            // earlier call of the thread left.
+            let (ret, errno) = match r {
+                Err(e) => (-1, e.raw_os_error().unwrap_or(0)),
+                Ok(_) => (
+                    0,
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                ),
+            };
+            log::trace(
+                format!("main_loop:769: src/main.c:769: recv: errno={errno}, ret={ret}, sc->socket={fd}\n")
+                    .as_bytes(),
+            );
             sc.chan.close.store(true, Ordering::SeqCst);
             return;
         }
     };
+    const COMMANDS: [&[u8]; 6] = [b"run", b"open", b"get", b"put", b"connect", b"boot"];
+    if COMMANDS.iter().any(|c| sdata.starts_with(c)) {
+        // `%s` of the buffer, terminated after the data unless it is full
+        // (C then reads past it, D28; here it stops at the end).
+        let shown = c_str(&sdata[..n]);
+        log::trace(
+            &[
+                format!("main_loop:780: src/main.c:780: sock={fd:x}, cmd/data recved: ").as_bytes(),
+                shown,
+                format!(", len={n}\n").as_bytes(),
+            ]
+            .concat(),
+        );
+    }
     let ch = sc.chan.channel.load(Ordering::SeqCst);
     let queued = sc.device.with(|m| {
         let _ = m.write(ch, &sdata[..n], Some(wake_main_loop()));
