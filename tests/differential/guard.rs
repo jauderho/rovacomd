@@ -4,11 +4,14 @@
 //!   accepts connections on 6968, 6969, 6970, 6971, 12311 or 64022, so no
 //!   test ever talks to a real daemon. The listener tables are read first
 //!   (no traffic); bind and connect probes follow.
-//! - Device safety: refuse to run while a USB device with a vendor id from
-//!   the C `usbid_list` (`src/host/device_list.c`: Palm 0x0830, HP 0x03F0,
-//!   Apple 0x05AC) is attached, because the C reference scans and claims
-//!   USB devices at start. macOS: `ioreg -p IOUSB -l -w0`; Linux:
-//!   `/sys/bus/usb/devices/*/idVendor`.
+//! - Device safety: refuse to run while a Palm device is attached, because
+//!   the C reference scans and claims USB devices at start. A Palm device is
+//!   any device with the Palm vendor id 0x0830, or an HP 0x03F0
+//!   vendor/product pair from the C `usbid_list` (`src/host/device_list.c`).
+//!   Other HP devices and all Apple devices (0x05AC, also in `usbid_list`)
+//!   are ignored, so hubs, printers and phones do not block tests. Every
+//!   device is checked, including devices behind hubs. macOS:
+//!   `ioreg -p IOUSB -l -w0`; Linux: `/sys/bus/usb/devices/*/id{Vendor,Product}`.
 //!
 //! Also: the listening sockets of one process (macOS `lsof`, Linux
 //! `/proc`), for the bind-address checks.
@@ -18,43 +21,64 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
+use rovacomd::usb::scan::USBID_LIST;
+
 /// The fixed ports of novacomd.
 pub const FIXED_PORTS: [u16; 6] = [6968, 6969, 6970, 6971, 12311, 64022];
-/// Vendor ids in the C `usbid_list`.
-pub const USBID_VENDORS: [u16; 3] = [0x0830, 0x03F0, 0x05AC];
+const PALM_VENDOR: u16 = 0x0830;
+const HP_VENDOR: u16 = 0x03F0;
+
+/// A USB device as (vendor id, product id).
+pub type UsbId = (u16, u16);
 
 pub fn assert_safe_to_start() {
     assert_no_palm_device();
     assert_ports_free();
 }
 
-/// Vendor ids from `ioreg -p IOUSB -l -w0` output (`"idVendor" = 2096`).
-pub fn parse_ioreg_vendor_ids(text: &str) -> Vec<u16> {
-    const KEY: &str = "\"idVendor\" = ";
-    text.lines()
-        .filter_map(|line| {
-            let rest = &line[line.find(KEY)? + KEY.len()..];
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            digits.parse().ok()
-        })
-        .collect()
+/// True for a Palm device: Palm vendor id with any product, or an HP pair
+/// from the C `usbid_list`. Apple ids are never Palm devices here.
+pub fn is_palm_device((vendor, product): UsbId) -> bool {
+    vendor == PALM_VENDOR
+        || (vendor == HP_VENDOR
+            && USBID_LIST
+                .iter()
+                .any(|&(v, p, _)| v == vendor && p == product))
 }
 
-/// Vendor id from a sysfs `idVendor` file (`"0830\n"`).
-pub fn parse_sysfs_vendor_id(text: &str) -> Option<u16> {
+/// Devices from `ioreg -p IOUSB -l -w0` output. Each `+-o` line starts a
+/// device; its own `"idVendor" = 2096` and `"idProduct" = 33026` lines come
+/// before the first child, in either order.
+pub fn parse_ioreg_devices(text: &str) -> Vec<UsbId> {
+    fn value(line: &str, key: &str) -> Option<u16> {
+        let rest = &line[line.find(key)? + key.len()..];
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    }
+    let mut devices = Vec::new();
+    let (mut vendor, mut product) = (None, None);
+    for line in text.lines().chain(std::iter::once("+-o end")) {
+        if line.contains("+-o ") {
+            if let Some(v) = vendor.take() {
+                devices.push((v, product.unwrap_or(0)));
+            }
+            product = None;
+        } else if let Some(v) = value(line, "\"idVendor\" = ") {
+            vendor = Some(v);
+        } else if let Some(p) = value(line, "\"idProduct\" = ") {
+            product = Some(p);
+        }
+    }
+    devices
+}
+
+/// Id from a sysfs `idVendor` or `idProduct` file (`"0830\n"`).
+pub fn parse_sysfs_id(text: &str) -> Option<u16> {
     u16::from_str_radix(text.trim(), 16).ok()
 }
 
-/// Ids of `ids` that are in the C `usbid_list`.
-pub fn usbid_matches(ids: &[u16]) -> Vec<u16> {
-    ids.iter()
-        .copied()
-        .filter(|id| USBID_VENDORS.contains(id))
-        .collect()
-}
-
 #[cfg(target_os = "macos")]
-fn usb_vendor_ids() -> Vec<u16> {
+fn usb_devices() -> Vec<UsbId> {
     let out = Command::new("/usr/sbin/ioreg")
         .args(["-p", "IOUSB", "-l", "-w0"])
         .output()
@@ -64,25 +88,37 @@ fn usb_vendor_ids() -> Vec<u16> {
         "ioreg failed ({}); refusing to run",
         out.status
     );
-    parse_ioreg_vendor_ids(&String::from_utf8_lossy(&out.stdout))
+    parse_ioreg_devices(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(target_os = "linux")]
-fn usb_vendor_ids() -> Vec<u16> {
+fn usb_devices() -> Vec<UsbId> {
     let Ok(dir) = std::fs::read_dir("/sys/bus/usb/devices") else {
         return Vec::new(); // no USB bus
     };
+    let read = |path: std::path::PathBuf| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| parse_sysfs_id(&t))
+    };
     dir.filter_map(Result::ok)
-        .filter_map(|e| std::fs::read_to_string(e.path().join("idVendor")).ok())
-        .filter_map(|t| parse_sysfs_vendor_id(&t))
+        .filter_map(|e| {
+            let vendor = read(e.path().join("idVendor"))?;
+            // A device without a readable product id is checked as product 0:
+            // a Palm vendor id still matches.
+            Some((vendor, read(e.path().join("idProduct")).unwrap_or(0)))
+        })
         .collect()
 }
 
 pub fn assert_no_palm_device() {
-    let found = usbid_matches(&usb_vendor_ids());
+    let found: Vec<UsbId> = usb_devices()
+        .into_iter()
+        .filter(|&d| is_palm_device(d))
+        .collect();
     assert!(
         found.is_empty(),
-        "Palm device attached: unplug it before running daemon tests (USB vendor ids {found:04x?})"
+        "Palm device attached: unplug it before running daemon tests (USB vendor:product {found:04x?})"
     );
 }
 
@@ -245,33 +281,65 @@ pub fn pid_listeners(pid: u32) -> BTreeSet<(String, u16)> {
 }
 
 #[test]
-fn ioreg_parser_finds_vendor_ids() {
+fn ioreg_parser_reads_each_device_behind_hubs() {
+    // Shape of real output: nested hubs, keys in either order, a hub's
+    // keys before its children, and one device without idProduct.
     let sample = "+-o Root  <class IORegistryEntry>\n\
-        \x20   |   \"idProduct\" = 33026\n\
-        \x20   |   \"idVendor\" = 2096\n\
-        \x20 | |     \"idVendor\" = 1133\n\
-        \x20 \"USB Vendor Name\" = \"Palm\"\n\
-        \x20     \"idVendor\" = 1452\n";
-    let ids = parse_ioreg_vendor_ids(sample);
-    assert_eq!(ids, vec![0x0830, 1133, 0x05AC]);
-    assert_eq!(usbid_matches(&ids), vec![0x0830, 0x05AC]);
+        \x20 +-o AppleT8112USBXHCI@00000000  <class AppleT8112USBXHCI>\n\
+        \x20 | +-o USB2.0 Hub@00100000  <class IOUSBHostDevice>\n\
+        \x20 | | |   \"idProduct\" = 10274\n\
+        \x20 | | |   \"idVendor\" = 8457\n\
+        \x20 | | +-o Gaming Mouse@00111000  <class IOUSBHostDevice>\n\
+        \x20 | | |     \"idVendor\" = 1133\n\
+        \x20 | | |     \"idProduct\" = 49970\n\
+        \x20 | | +-o USB2.0 Hub@00114000  <class IOUSBHostDevice>\n\
+        \x20 | |   |   \"idProduct\" = 10258\n\
+        \x20 | |   |   \"idVendor\" = 8457\n\
+        \x20 | |   +-o iPhone@00114300  <class IOUSBHostDevice>\n\
+        \x20 | |   |     \"idProduct\" = 4776\n\
+        \x20 | |   |     \"idVendor\" = 1452\n\
+        \x20 | |   +-o Pre3@00114400  <class IOUSBHostDevice>\n\
+        \x20 | |         \"USB Vendor Name\" = \"Palm\"\n\
+        \x20 | |         \"idVendor\" = 2096\n\
+        \x20 | |         \"idProduct\" = 33026\n\
+        \x20 | +-o Odd@00200000  <class IOUSBHostDevice>\n\
+        \x20 |       \"idVendor\" = 1008\n";
     assert_eq!(
-        usbid_matches(&parse_ioreg_vendor_ids("\"idVendor\" = 1008")),
-        vec![0x03F0]
+        parse_ioreg_devices(sample),
+        vec![
+            (8457, 10274),
+            (1133, 49970),
+            (8457, 10258),
+            (0x05AC, 0x12A8),
+            (0x0830, 0x8102),
+            (0x03F0, 0),
+        ]
     );
-    assert!(usbid_matches(&parse_ioreg_vendor_ids("\"idVendor\" = 8457\nno ids\n")).is_empty());
+}
+
+#[test]
+fn palm_device_rule() {
+    // Palm vendor: any product, also one not in usbid_list.
+    assert!(is_palm_device((0x0830, 0x8102)));
+    assert!(is_palm_device((0x0830, 0xFFFF)));
+    // HP: only pairs from usbid_list.
+    assert!(is_palm_device((0x03F0, 0x1128)));
+    assert!(is_palm_device((0x03F0, 0x5f28)));
+    assert!(!is_palm_device((0x03F0, 0x0000)));
+    assert!(!is_palm_device((0x03F0, 0x1D02))); // an HP printer id
+    // Apple: never, even the pairs in usbid_list.
+    assert!(!is_palm_device((0x05AC, 0x12A8)));
+    assert!(!is_palm_device((0x05AC, 0x8002)));
+    assert!(!is_palm_device((0x05AC, 0x0101)));
+    // Others.
+    assert!(!is_palm_device((0x2109, 0x2812)));
 }
 
 #[test]
 fn sysfs_parser_reads_hex() {
-    assert_eq!(parse_sysfs_vendor_id("0830\n"), Some(0x0830));
-    assert_eq!(parse_sysfs_vendor_id("1d6b\n"), Some(0x1d6b));
-    assert_eq!(parse_sysfs_vendor_id("zz"), None);
-    let ids: Vec<u16> = ["03f0\n", "1d6b\n"]
-        .iter()
-        .filter_map(|t| parse_sysfs_vendor_id(t))
-        .collect();
-    assert_eq!(usbid_matches(&ids), vec![0x03F0]);
+    assert_eq!(parse_sysfs_id("0830\n"), Some(0x0830));
+    assert_eq!(parse_sysfs_id("1d6b\n"), Some(0x1d6b));
+    assert_eq!(parse_sysfs_id("zz"), None);
 }
 
 #[test]
