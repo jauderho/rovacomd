@@ -6,10 +6,12 @@
 
 use super::pmux::*;
 use super::*;
+use std::sync::{Arc, Condvar};
 
 /// A client of the log port, read on a thread until the daemon closes it.
 pub struct LogTap {
-    h: JoinHandle<Vec<u8>>,
+    h: JoinHandle<()>,
+    buf: Arc<(Mutex<Vec<u8>>, Condvar)>,
 }
 
 impl LogTap {
@@ -19,21 +21,55 @@ impl LogTap {
     pub fn connect() -> Self {
         let mut s = TcpStream::connect((LOCALHOST, 6970)).expect("connect log port");
         s.set_read_timeout(Some(TIMEOUT * 6)).expect("timeout");
+        let buf = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let shared = Arc::clone(&buf);
         let h = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            buf
+            let mut chunk = [0u8; 4096];
+            while let Ok(n @ 1..) = s.read(&mut chunk) {
+                let (m, cv) = &*shared;
+                m.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]);
+                cv.notify_all();
+            }
         });
         devlist();
         devlist();
-        Self { h }
+        Self { h, buf }
+    }
+
+    /// Waits (at most [`TIMEOUT`]) until the log holds `text`. The device
+    /// list drops a device before the daemon logs the shutdown of its
+    /// channels, so a scenario waits for that line before it stops the
+    /// daemon, whose version line must come last.
+    pub fn wait_for(&self, text: &[u8]) {
+        let (m, cv) = &*self.buf;
+        let deadline = Instant::now() + TIMEOUT;
+        let mut log = m.lock().unwrap_or_else(PoisonError::into_inner);
+        while !log.windows(text.len()).any(|w| w == text) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "log: timed out waiting for {:?}",
+                String::from_utf8_lossy(text)
+            );
+            log = cv
+                .wait_timeout(log, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Everything received until the daemon closed the connection.
+    pub fn raw(self) -> Vec<u8> {
+        self.h.join().expect("log reader");
+        std::mem::take(&mut *self.buf.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Everything received, normalized; `drop_timing` removes the lines
     /// whose presence depends on retransmission timing.
     pub fn finish(self, bin: &Bin, drop_timing: bool) -> Vec<u8> {
-        let raw = self.h.join().expect("log reader");
-        normalize_log(&raw, bin, drop_timing)
+        normalize_log(&self.raw(), bin, drop_timing)
     }
 }
 
@@ -147,6 +183,7 @@ fn latest_log_client_wins() {
         wait_list(|l| lines(l) == 1);
         drop(dev);
         wait_list(<[u8]>::is_empty);
+        b.wait_for(b"] shutting down channel 1\n");
         let _ = d.stop();
         (first, b.finish(bin, false))
     });
@@ -201,8 +238,9 @@ fn mux_trace_lines() {
         dev.send_control(99, 5);
         drop(dev);
         wait_list(<[u8]>::is_empty);
+        tap.wait_for(b"] shutting down channel -2147483631\n");
         let _ = d.stop();
-        let raw = tap.h.join().expect("log");
+        let raw = tap.raw();
         (
             normalize_log(&raw, bin, true),
             normalize_log(&raw, bin, false),
@@ -299,6 +337,7 @@ fn relay_trace_lines() {
         // device's packet.
         drop(dev);
         wait_list(<[u8]>::is_empty);
+        tap.wait_for(b"] shutting down channel 1\n");
         let _ = d.stop();
         String::from_utf8_lossy(&mask_relay(&tap.finish(bin, true))).into_owned()
     });

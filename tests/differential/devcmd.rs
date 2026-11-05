@@ -128,6 +128,7 @@ fn run<T>(bin: &Bin, script: impl FnOnce(&Pmux) -> T) -> Run<T> {
     let transcript = dev.transcript();
     drop(dev);
     wait_list(<[u8]>::is_empty);
+    tap.wait_for(b"] shutting down channel 1\n");
     let out = d.stop();
     let log = tap.finish(bin, true);
     Run {
