@@ -1,0 +1,68 @@
+name: Rust
+
+# Native Linux and macOS checks for the rovacomd port: format, clippy and
+# the unit tests. The differential tests are not run: they need the C
+# reference (scripts/build-reference.sh), a rovacom checkout and its C
+# client build. No device tests: hardware-dependent tests are not part of CI.
+
+on:
+  pull_request: {}
+  push:
+    branches:
+    - main
+    paths:
+    - Cargo.toml
+    - Cargo.lock
+    - src/**
+    - tests/**
+    - .github/workflows/rust.yml
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-24.04-arm, macos-26, macos-26-intel]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+    - name: Harden Runner
+      if: runner.os == 'Linux'
+      uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+      with:
+        egress-policy: block
+        disable-telemetry: true
+        allowed-endpoints: >
+          github.com:443
+          static.rust-lang.org:443
+          index.crates.io:443
+          static.crates.io:443
+
+    - name: Checkout Code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      run: |
+        rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        rustup default stable
+        rustc --version --verbose
+        uname -a
+
+    - name: Format
+      run: cargo fmt --check
+
+    - name: Clippy
+      run: cargo clippy --all-targets --locked -- -D warnings
+
+    - name: Test
+      run: cargo test --lib --locked
