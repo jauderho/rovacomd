@@ -7,8 +7,8 @@
 #   1. Download libusb 1.0.30 and libusb-compat 0.1.9 release tarballs from
 #      GitHub and check their SHA-256 digests.
 #   2. Build libusb-1.0 (configure/make) and libusb-0.1 (libusb-compat
-#      core.c compiled directly; its configure needs pkg-config macros) into
-#      reference/deps/prefix.
+#      core.c compiled directly, without its exit-time destructor; its
+#      configure needs pkg-config macros) into reference/deps/prefix.
 #   3. Clone openwebos/novacomd at the pinned commit into
 #      reference/novacomd, apply scripts/patches/novacomd-macos.patch (build
 #      enablement only; on Linux it changes nothing) and
@@ -149,6 +149,15 @@ if [[ ! -f "${PREFIX}/include/usb.h" ]]; then
 	# libusb-0.1 API on top of libusb-1.0: one source file. config.h only
 	# needs the export macro.
 	compat="${DEPS}/src/libusb-compat-0.1.9"
+	# Remove the `_usb_exit` destructor: at `exit` it frees the bus list and
+	# calls libusb_exit while novacomd's USB scan thread may still use them,
+	# so the reference sometimes crashes (SIGSEGV or a usbi_mutex_lock
+	# assertion) when it exits. libusb-0.1, which novacomd was built
+	# against, has no such destructor.
+	run sed -i.orig 's/static void __attribute__ ((destructor)) _usb_exit/static void _usb_exit/' "${compat}/libusb/core.c"
+	if ((! dryrun)) && grep -q 'destructor' "${compat}/libusb/core.c"; then
+		die "libusb-compat destructor not removed"
+	fi
 	if ((dryrun)); then
 		printf 'dryrun: write %s/config.h\n' "${compat}"
 	else
