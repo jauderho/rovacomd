@@ -427,7 +427,7 @@ No configuration files and no environment variables are read on the host (`geten
 | D32 | `main.c:252` | `sc->channel > 0` true for `(uint32_t)-1` | `close_channel(0xffffffff)` on failed sockets (returns −1, harmless) |
 | D33 | `main.c:1243-1246` | Device chosen by nduid **prefix** of the URL path; empty path → first device | Commands may hit the wrong device if ids differ in length (inet peers) |
 
-Unsafe or nondeterministic defects are candidates for "intentionally changed" (as decided for the client port); deterministic quirks (NUL-terminated replies, no `ok` for `list`, prefix matching, 999 ms heartbeat, odd-length padding rule, timestamps) are candidates to preserve. Decision pending (Q2, Q5).
+Unsafe or nondeterministic defects are candidates for "intentionally changed" (as decided for the client port); deterministic quirks (NUL-terminated replies, no `ok` for `list`, prefix matching, 999 ms heartbeat, odd-length padding rule, timestamps) are preserved. Decided in Q2 and Q5 (Section 10).
 
 ## 7. Hardware vs mock testing
 
@@ -460,15 +460,15 @@ Unsafe or nondeterministic defects are candidates for "intentionally changed" (a
 | `usbll.rs` | `transport_usb.c` HOST paths, `recovery.c` | shared, pure |
 | `inet.rs` | `transport_inet.c` | shared |
 | `cmdparse.rs`, `wirebuf.rs`, `cmdservice.rs`, `tokens.rs` | `commands.c`, `buffer.c`, `host/commands_service.c`, `tokenstorage.c` | shared; home lookup via `getpwuid_r` |
-| `devcmd.rs` | host-reachable part of `commands_device.c`/`packet.c` | shared; pending Q2 |
-| `usb/mod.rs` | `UsbBackend` trait: enumerate (VID/PID table from `device_list.c`, interface match), claim, bulk read/write with timeout | shared trait + `usb/linux.rs` and `usb/macos.rs` |
-| `usb/linux.rs` | `usb-linux.c`: usbdevfs `USBDEVFS_CLAIMINTERFACE`/`USBDEVFS_BULK` via `libc::ioctl`, enumeration from `/dev/bus/usb` descriptors [H, equivalent of libusb-0.1] | Linux |
-| `usb/macos.rs` | patched path: libusb-1.0 via `rusb` (same stack as the patched C reference) | macOS |
-| `sys.rs` | `fork`/`setsid`/`umask`/`chdir` daemonize, `SIGPIPE` ignore, `geteuid` | unix, minor `cfg` |
+| `devcmd.rs` | host-reachable part of `commands_device.c`/`packet.c` | shared; kept as C (Q2, D1) |
+| `usb.rs` | `usb-linux.c` rx and tx threads per device, I/O retries, recovery hand-over, over the `UsbLink` trait | shared |
+| `usb/scan.rs` | VID/PID table from `device_list.c`, interface match, find-and-attach thread | shared |
+| `usb/backend.rs` | `usb-linux.c` / libusb-compat equivalent: open, claim, bulk read/write with timeout via `nusb` (usbfs on Linux, IOKit on macOS) | shared (Q3) |
+| `sys.rs` | `fork`/`setsid`/`umask`/`chdir` daemonize, `poll`, `getpwuid_r`, `getaddrinfo`, syslog; no root check (Q3) | unix, minor `cfg` |
 
-Proposed dependencies (versions recorded when added): `libc` (MIT/Apache-2.0; syscalls above, all `unsafe` confined to `net.rs`, `sys.rs`, `usb/linux.rs`); `sha1` (RustCrypto, MIT/Apache-2.0, same as the client port; token hash); `rusb` (MIT, macOS only, dynamically links libusb-1.0 which is LGPL-2.1, needs Homebrew/MacPorts libusb at build and run time). Not proposed: tokio, clap, nix. Linux could also use `rusb` (non-root with udev rules) at the cost of a native dependency and a behavior change for the root check (Q3).
+Dependencies (see `Cargo.toml`): `libc` 0.2.191 (MIT/Apache-2.0; syscalls above, all `unsafe` confined to `sys.rs`); `sha1` 0.11.0 (RustCrypto, MIT/Apache-2.0, same as the client port; token hash); `nusb` 0.2.9 (MIT/Apache-2.0, pure Rust, no libusb; chosen in Q3). Not used: tokio, clap, nix, `rusb`.
 
-Proposed support (not verified): Linux glibc x86_64/aarch64 with usbdevfs; macOS 11+ arm64/x86_64 with libusb-1.0 ≥ 1.0.24 [H].
+Supported: Linux x86_64/aarch64 with usbfs; macOS arm64/x86_64 via IOKit. Tested on Linux x86_64 and macOS arm64 [V]; aarch64 Linux and x86_64 macOS are untested [H].
 
 ### 8.2 First slice: inet device registration and device list
 
