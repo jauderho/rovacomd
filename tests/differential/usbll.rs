@@ -552,7 +552,7 @@ fn data(txid: u32, rxid: u32, payload: &[u8]) -> Vec<u8> {
 
 /// A pmux-like packet of `len` bytes (bytes `seed`, `seed+1`, ...).
 fn pmux(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    Vec::from_fn(len, |i| seed.wrapping_add(i as u8))
 }
 
 const DEV: u32 = 0xd0d0_0001;

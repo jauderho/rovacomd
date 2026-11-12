@@ -109,10 +109,10 @@ impl<C> BufQueue<C> {
                     fired.push(c);
                 }
             } else {
-                if left > 0 {
-                    if let Some(Entry::Data(d)) = self.entries.front_mut() {
-                        d.drain(..left);
-                    }
+                if left > 0
+                    && let Some(Entry::Data(d)) = self.entries.front_mut()
+                {
+                    d.drain(..left);
                 }
                 break;
             }

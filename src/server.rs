@@ -81,10 +81,10 @@ pub fn unblock_main_loop() {
             }
         }
     }
-    if let Some(s) = w.as_ref() {
-        if (&*s).write(&[0]).is_err() {
-            *w = None;
-        }
+    if let Some(s) = w.as_ref()
+        && (&*s).write(&[0]).is_err()
+    {
+        *w = None;
     }
 }
 
@@ -488,33 +488,23 @@ fn main_loop(l: &Listeners) -> ! {
             // C then tests the new fd against the old select set: not set.
             unblock_read_ready = false;
         }
-        if unblock_read_ready {
-            if let Some(s) = &unblock_read {
-                // recv() == 0 (EOF) keeps the socket, as in C (D10).
-                if (&*s).read(&mut [0u8; 1]).is_err() {
-                    unblock_read = None;
-                }
+        if unblock_read_ready && let Some(s) = &unblock_read {
+            // recv() == 0 (EOF) keeps the socket, as in C (D10).
+            if (&*s).read(&mut [0u8; 1]).is_err() {
+                unblock_read = None;
             }
         }
-        if opt {
-            if let Ok((s, _)) = l.opt.accept() {
-                handle_opt_connection(&s);
-            }
+        if opt && let Ok((s, _)) = l.opt.accept() {
+            handle_opt_connection(&s);
         }
-        if devlist {
-            if let Ok((s, _)) = l.devlist.accept() {
-                devices::dump_device_list(&s);
-            }
+        if devlist && let Ok((s, _)) = l.devlist.accept() {
+            devices::dump_device_list(&s);
         }
-        if log_ready {
-            if let Ok((s, _)) = l.log.accept() {
-                log::add_socket(s);
-            }
+        if log_ready && let Ok((s, _)) = l.log.accept() {
+            log::add_socket(s);
         }
-        if ctrl {
-            if let Ok((s, _)) = l.ctrl.accept() {
-                register_command(s);
-            }
+        if ctrl && let Ok((s, _)) = l.ctrl.accept() {
+            register_command(s);
         }
         // C walks its per-pass list, which is oldest device first.
         for (d, at) in devs.iter().zip(&dev_at).rev() {

@@ -285,7 +285,7 @@ pub mod tests {
     fn read_hash() {
         let h = TempHome::create();
         let s = h.store();
-        let token: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+        let token: Vec<u8> = Vec::from_fn(300, |i| (i * 7) as u8);
         s.store(b"dev", &token).unwrap();
         let want = sha1_hex(&[&token[..256], b"0123456789"].concat());
         assert_eq!(s.read_hash(b"dev", b"0123456789"), Some(want));

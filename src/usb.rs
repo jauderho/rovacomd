@@ -972,7 +972,7 @@ mod tests {
         use crate::tokens::tests::TempHome;
 
         let home = TempHome::create();
-        let token: Vec<u8> = (0..256u32).map(|i| (i * 7) as u8).collect();
+        let token: Vec<u8> = Vec::from_fn(256, |i| (i * 7) as u8);
         std::fs::create_dir(home.nova()).unwrap();
         std::fs::write(
             home.nova().join(std::str::from_utf8(DEV_NDUID).unwrap()),

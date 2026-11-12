@@ -139,16 +139,16 @@ pub fn log(mask: u32, body: &[u8]) {
     if mask & SYSLOG_MASK != 0 {
         sys::syslog_alert(&msg[ts.len()..]);
     }
-    if mask & SOCKET_MASK != 0 {
-        if let Some(s) = st.socket.as_ref() {
-            // One non-blocking send (`MSG_DONTWAIT`); a partial send is
-            // ignored, an error other than EAGAIN drops the client.
-            if let Err(e) = (&*s).write(&msg) {
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    let _ = s.shutdown(Shutdown::Both);
-                    st.socket = None;
-                }
-            }
+    if mask & SOCKET_MASK != 0
+        && let Some(s) = st.socket.as_ref()
+    {
+        // One non-blocking send (`MSG_DONTWAIT`); a partial send is
+        // ignored, an error other than EAGAIN drops the client.
+        if let Err(e) = (&*s).write(&msg)
+            && e.kind() != io::ErrorKind::WouldBlock
+        {
+            let _ = s.shutdown(Shutdown::Both);
+            st.socket = None;
         }
     }
 }

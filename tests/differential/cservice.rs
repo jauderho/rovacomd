@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::mem::DropGuard;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -246,18 +247,6 @@ struct FakeDevice {
     rx_seq: u32,
 }
 
-/// Takes every registered test device offline when dropped, so a failed
-/// run leaves the registry empty.
-struct Devices(Vec<FakeDevice>);
-
-impl Drop for Devices {
-    fn drop(&mut self) {
-        for d in &self.0 {
-            devices::go_offline(&d.mux);
-        }
-    }
-}
-
 fn packet(flags: u16, channel: u32, sequence: u32, payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let h = Header {
@@ -293,8 +282,8 @@ fn record(out: &mut Vec<String>, idx: usize, dev: &mux::Device, p: &[u8]) {
 }
 
 /// Records and acknowledges everything the daemon has queued.
-fn drain(out: &mut Vec<String>, devs: &Devices) {
-    for (idx, d) in devs.0.iter().enumerate() {
+fn drain(out: &mut Vec<String>, devs: &[FakeDevice]) {
+    for (idx, d) in devs.iter().enumerate() {
         while let Some(p) = d
             .mux
             .with(|m| m.prepare_tx_packet(Instant::now(), PACKET_LEN))
@@ -321,7 +310,13 @@ fn client_state(c: &mut TcpStream) -> (Vec<u8>, bool) {
 
 fn run_rust(home: &Path, steps: &[Step]) -> Vec<String> {
     let mut out = Vec::new();
-    let mut devs = Devices(Vec::new());
+    // Takes every registered test device offline when dropped, so a failed
+    // run leaves the registry empty.
+    let mut devs = DropGuard::new(Vec::<FakeDevice>::new(), |devs| {
+        for d in &devs {
+            devices::go_offline(&d.mux);
+        }
+    });
     let mut clients: Vec<TcpStream> = Vec::new();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind client listener");
     for s in steps {
@@ -332,8 +327,8 @@ fn run_rust(home: &Path, steps: &[Step]) -> Vec<String> {
                     tokens: tokens::TokenStore::with_home(home),
                 };
                 let (dev, init) = devices::go_online(id, b"usb", b"castle-linux", Some(session));
-                let idx = devs.0.len();
-                devs.0.push(FakeDevice {
+                let idx = devs.len();
+                devs.push(FakeDevice {
                     mux: Arc::clone(&dev),
                     rx_seq: 0,
                 });
@@ -355,13 +350,13 @@ fn run_rust(home: &Path, steps: &[Step]) -> Vec<String> {
                 drain(&mut out, &devs);
             }
             Step::Reply(d, data) => {
-                let dev = &mut devs.0[*d];
+                let dev = &mut devs[*d];
                 dev.rx_seq += 1;
                 let p = packet(0, CHANNEL_CMDSERVICE, dev.rx_seq, data);
                 dev.mux.process_packet(&p, p.len());
                 drain(&mut out, &devs);
             }
-            Step::Unregister(d) => devices::go_offline(&devs.0[*d].mux),
+            Step::Unregister(d) => devices::go_offline(&devs[*d].mux),
         }
     }
     for (k, c) in clients.iter_mut().enumerate() {
