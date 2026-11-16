@@ -33,6 +33,8 @@ The differential tests (`cargo test --test differential`) run the same scenarios
 
 They use the fixed ports, so they refuse to run while another novacomd is running, and they refuse to run while a Palm device is attached.
 
+Every test daemon runs with the test-only environment variable `ROVACOMD_TEST_NO_USB` set. When it is set (any value), rovacomd and the patched C reference do not start the USB scan, so the tests never claim a USB device.
+
 ## Repository CI baseline
 
 Baseline GitHub Actions used by this repository, plus a Rust workflow (format, clippy, unit tests on Linux and macOS):

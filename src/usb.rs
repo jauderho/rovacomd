@@ -19,6 +19,7 @@
 //! The tx thread spins without pause while the link waits for the
 //! device's SYN, as in C.
 
+use std::ffi::OsStr;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -508,7 +509,14 @@ pub fn tx_loop<K: UsbLink, H: Host>(h: &UsbHandle<K, H::Dev>, host: &H, s: Setti
 /// `need to run as super user to access usb` when not root; there is no
 /// such check here (devices that cannot be opened are reported by
 /// [`scan::Scanner`]).
+///
+/// Test-only addition with no C equivalent (C always scans): when the
+/// environment variable [`TEST_NO_USB`] is set, no scan thread starts, so
+/// the daemon never touches USB.
 pub fn start(tokens: TokenStore) {
+    if usb_disabled(std::env::var_os(TEST_NO_USB).as_deref()) {
+        return;
+    }
     let host = Arc::new(Daemon::new(tokens));
     let _ = inet::spawn(move || {
         let mut scanner = scan::Scanner::new(backend::Nusb);
@@ -519,6 +527,16 @@ pub fn start(tokens: TokenStore) {
             });
         }
     });
+}
+
+/// Test-only environment variable: when set (any value), [`start`] does
+/// nothing.
+const TEST_NO_USB: &str = "ROVACOMD_TEST_NO_USB";
+
+/// Whether the value of [`TEST_NO_USB`] disables the USB scan: set, with
+/// any value (also empty).
+fn usb_disabled(var: Option<&OsStr>) -> bool {
+    var.is_some()
 }
 
 /// The daemon's link-layer environment: wall clock, `rand()`, the host
@@ -591,6 +609,14 @@ mod tests {
     };
     use crate::usbll::{CMD_DATA, CMD_NULL, CMD_SYN, Header, State};
     use std::collections::VecDeque;
+
+    #[test]
+    fn usb_disabled_when_variable_is_set() {
+        assert!(!usb_disabled(None));
+        assert!(usb_disabled(Some(OsStr::new("1"))));
+        assert!(usb_disabled(Some(OsStr::new("0"))));
+        assert!(usb_disabled(Some(OsStr::new(""))));
+    }
 
     const ETIMEDOUT: i32 = 110;
     const EPIPE: i32 = 32;

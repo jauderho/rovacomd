@@ -14,7 +14,10 @@
 #      enablement only; on Linux it changes nothing) and
 #      scripts/patches/novacomd-test-noroot.patch (test enablement: with
 #      REFERENCE_NO_ROOT_CHECK, Linux skips the root check so the TCP side
-#      runs without root), and compile the host sources with cc (the
+#      runs without root) and scripts/patches/novacomd-test-nousb.patch
+#      (test enablement: with the environment variable
+#      ROVACOMD_TEST_NO_USB set, the daemon does not start the USB scan
+#      thread), and compile the host sources with cc (the
 #      upstream CMake build needs the webOS cmake modules). Output:
 #      reference/novacomd/build/novacomd
 #
@@ -47,7 +50,7 @@ readonly REF="${ROOT}/reference"
 readonly DEPS="${REF}/deps"
 readonly PREFIX="${DEPS}/prefix"
 readonly SRC_DIR="${REF}/novacomd"
-readonly PATCHES=("${ROOT}/scripts/patches/novacomd-macos.patch" "${ROOT}/scripts/patches/novacomd-test-noroot.patch")
+readonly PATCHES=("${ROOT}/scripts/patches/novacomd-macos.patch" "${ROOT}/scripts/patches/novacomd-test-noroot.patch" "${ROOT}/scripts/patches/novacomd-test-nousb.patch")
 
 dryrun=0
 verbose=0
@@ -72,7 +75,7 @@ run() {
 		"$@"
 	fi
 }
-usage() { sed -n '3,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while (($#)); do
 	case "$1" in

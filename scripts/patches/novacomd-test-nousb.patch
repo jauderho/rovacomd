@@ -1,0 +1,38 @@
+diff --git a/src/host/usb-linux.c b/src/host/usb-linux.c
+index f0ab487..5d4d73c 100644
+--- a/src/host/usb-linux.c
++++ b/src/host/usb-linux.c
+@@ -17,6 +17,7 @@
+ * LICENSE@@@ */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <usb.h>
+ #include <stdint.h>
+ #include <sys/time.h>
+@@ -624,7 +625,12 @@ static void *novacom_usb_findandattach_thread(void *arg)
+ int novacom_usb_transport_start(void)
+ {
+ 	novacom_shutdown = 0;
+-	platform_create_thread(&findandattach_thread, &novacom_usb_findandattach_thread, NULL);
++	/* ROVACOMD_TEST_NO_USB (rovacomd tests only): when the variable is set,
++	 * do not start the find-and-attach thread, so the daemon never scans or
++	 * claims a USB device. */
++	if (getenv("ROVACOMD_TEST_NO_USB") == NULL) {
++		platform_create_thread(&findandattach_thread, &novacom_usb_findandattach_thread, NULL);
++	}
+ 	platform_mutex_init(&recovery_lock);
+ 	return 0;
+ }
+@@ -633,7 +639,10 @@ int novacom_usb_transport_stop(void)
+ {
+ 	novacom_shutdown = 1;
+ 
+-	platform_waitfor_thread(findandattach_thread);
++	/* No thread to wait for when ROVACOMD_TEST_NO_USB is set (see start). */
++	if (getenv("ROVACOMD_TEST_NO_USB") == NULL) {
++		platform_waitfor_thread(findandattach_thread);
++	}
+ 	platform_mutex_destroy(&recovery_lock);
+ 
+ 	return 0;

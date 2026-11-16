@@ -20,7 +20,7 @@ Commands (run in the repository root): `cargo fmt --check`, `cargo clippy --all-
 | Item | macOS | Linux |
 |---|---|---|
 | fmt / clippy `-D warnings` | executed 2026-11-16, passed | executed 2026-11-16, passed |
-| Unit tests | executed 2026-11-16, 122 passed | executed 2026-11-16, 121 passed (some tests are OS-specific) |
+| Unit tests | executed 2026-11-16, 123 passed | executed 2026-11-16, 122 passed (some tests are OS-specific) |
 | Differential tests vs the C reference (CLI, daemon, inet, pmux, relay, command service, USB link layer, device commands, log port, pairings) | executed 2026-11-16, 91 passed | executed 2026-11-16, 94 passed (3 tests are Linux-only) |
 | Device-command and log-port tests repeated | 25 of 25 passed (2026-11-04) | 20 of 20 passed (before the log-order fix) |
 | Pairings {C novacom, rovacom, rovacom as `novacom`} × {C novacomd, rovacomd, rovacomd as `novacomd`}, one fake inet device | executed, passed | executed, passed |
@@ -32,12 +32,11 @@ Commands (run in the repository root): `cargo fmt --check`, `cargo clippy --all-
 ## Known limits
 
 - The Linux C reference daemon is not a valid USB reference: with libusb-compat it calls `ioctl(USBDEVFS_BULK)` on a field that is no longer a file descriptor (`usb-linux.c:302,332`). Never run it with the Pre3 attached. The macOS build uses `usb_bulk_read`/`usb_bulk_write` and is usable.
-- The test guard checks for an attached Palm device only when each test daemon starts. A device plugged in during a test run is claimed by the running daemon. Do not connect the Pre3 while `cargo test` runs.
+- Test daemons (C and Rust) run with `ROVACOMD_TEST_NO_USB` set and do not start the USB scan, so a device plugged in during a test run is not claimed. The guard still refuses to start a test daemon while a Palm device is attached.
 - Local denial-of-service paths are kept as in C (D7, D8, D10): any local process can stop or stall the daemon through ports 64022, 6971 and 12311.
 
 ## Remaining work before full replacement
 
 1. Push the branch and run CI on real runners; add Linux arm64 and macOS x86_64 coverage.
 2. Rehearse the USB backend against a fake USB device (for example `dummy_hcd` with FunctionFS in a Linux VM).
-3. Close the test guard gap above.
-4. With per-action approval, read-only tests against the Pre3: enumeration with OS tools, then `rovacom -l`, `run file:///bin/uname -a` and `get file:///etc/palm-build-info`.
+3. With per-action approval, read-only tests against the Pre3: enumeration with OS tools, then `rovacom -l`, `run file:///bin/uname -a` and `get file:///etc/palm-build-info`.

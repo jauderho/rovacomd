@@ -4,10 +4,12 @@
 //! inputs, and compare exit status, stdout and stderr byte for byte after
 //! normalizing timestamps, the version string and ephemeral ports.
 //!
-//! Safety rules (see `guard`): every daemon start is serialized by one
-//! process-wide lock and is refused unless all six fixed ports are free and
-//! no Palm/HP/Apple USB device from the C `usbid_list` is attached. Every
-//! spawned daemon is killed when its handle drops, also on panic.
+//! Safety rules: every daemon runs with `ROVACOMD_TEST_NO_USB` set, so no
+//! test daemon scans USB. As a second check (see `guard`), every daemon
+//! start is serialized by one process-wide lock and is refused unless all
+//! six fixed ports are free and no Palm/HP USB device from the C
+//! `usbid_list` is attached (Apple devices are ignored). Every spawned
+//! daemon is killed when its handle drops, also on panic.
 
 #[path = "differential/cli.rs"]
 mod cli;
@@ -244,6 +246,9 @@ impl Daemon {
             .stderr(Stdio::piped())
             .env_remove("POSIXLY_CORRECT");
         tweak(&mut cmd);
+        // After `tweak`, so that no caller can drop it: no test daemon
+        // scans USB.
+        cmd.env("ROVACOMD_TEST_NO_USB", "1");
         let mut child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {}: {e}", bin.path.display()));
