@@ -18,3 +18,11 @@ path = "src/main.rs"
 libc = "0.2.191"
 nusb = "0.2.9"
 sha1 = { version = "0.11.0", default-features = false }
+
+# A panicking thread must end the daemon, as a crash ends the C daemon.
+# With unwinding, a dead USB thread leaves its device listed but unusable.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
