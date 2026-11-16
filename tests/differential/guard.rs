@@ -4,14 +4,16 @@
 //!   accepts connections on 6968, 6969, 6970, 6971, 12311 or 64022, so no
 //!   test ever talks to a real daemon. The listener tables are read first
 //!   (no traffic); bind and connect probes follow.
-//! - Device safety: refuse to run while a Palm device is attached, because
-//!   the C reference scans and claims USB devices at start. A Palm device is
+//! - Device safety: refuse to run while a Palm device is attached. Test
+//!   daemons run with `ROVACOMD_TEST_NO_USB` set and do not scan USB; this
+//!   check is a second line of defense. A Palm device is
 //!   any device with the Palm vendor id 0x0830, or an HP 0x03F0
 //!   vendor/product pair from the C `usbid_list` (`src/host/device_list.c`).
 //!   Other HP devices and all Apple devices (0x05AC, also in `usbid_list`)
 //!   are ignored, so hubs, printers and phones do not block tests. Every
 //!   device is checked, including devices behind hubs. macOS:
-//!   `ioreg -p IOUSB -l -w0`; Linux: `/sys/bus/usb/devices/*/id{Vendor,Product}`.
+//!   `ioreg -p IOUSB -l -w0`; Linux: `/sys/bus/usb/devices/*/id{Vendor,Product}`
+//!   (a missing directory means no USB bus; any other read error refuses).
 //!
 //! Also: the listening sockets of one process (macOS `lsof`, Linux
 //! `/proc`), for the bind-address checks.
@@ -93,8 +95,10 @@ fn usb_devices() -> Vec<UsbId> {
 
 #[cfg(target_os = "linux")]
 fn usb_devices() -> Vec<UsbId> {
-    let Ok(dir) = std::fs::read_dir("/sys/bus/usb/devices") else {
-        return Vec::new(); // no USB bus
+    let dir = match std::fs::read_dir("/sys/bus/usb/devices") {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(), // no USB bus
+        Err(e) => panic!("cannot list USB devices in /sys/bus/usb/devices: {e}; refusing to run"),
     };
     let read = |path: std::path::PathBuf| {
         std::fs::read_to_string(path)
