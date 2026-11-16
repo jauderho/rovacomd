@@ -2,7 +2,7 @@
 
 The port is named **rovacomd**. It is the server side of the protocol that the `rovacom` client (`~/projects/rovacom`, see its `docs/ASSESSMENT.md`) speaks, plus the USB (and TCP "inet") link to the device. Wire bytes, ports and command strings must stay identical so that unmodified `novacom`/`rovacom` clients and unmodified devices see no difference. novacom and novacomd were designed as a pair; rovacom and rovacomd must work as a pair too, and every mix must work: {rovacom, novacom} × {rovacomd, novacomd}, with the Rust binaries also invoked under the names `novacom` and `novacomd`.
 
-Status: inspection only. No Rust code written. The source reading below did not build, run or modify the C tree; the reference builds are recorded in Section 9.1.
+Status: this is the pre-port assessment; the port is now implemented (see [STATUS.md](STATUS.md)). The source reading below did not build, run or modify the C tree; the reference builds are recorded in Section 9.1.
 Legend: **[V]** verified by reading source; **[H]** hypothesis, not yet verified. Line numbers refer to the upstream commit below (for `src/host/usb-linux.c`, to `git show HEAD:src/host/usb-linux.c`, not the patched working copy).
 
 ## 1. Source under port
@@ -246,7 +246,7 @@ Automatic token login: when a device registers with a session id, the device-ini
 
 ### 4.7 USB link layer (`transport_usb.c`, `transport_usb_struct.h`) [V]
 
-All integers **host-native** byte order (no conversion anywhere); the device is little-endian ARM [H], so the port encodes explicit little-endian.
+All integers **host-native** byte order (no conversion anywhere); the device is little-endian ARM [H]. The port keeps host-native order as C does (`to_ne_bytes`/`from_ne_bytes` in `usbll.rs` and `mux.rs`); every supported host (x86_64, arm64) is little-endian.
 
 ```
 usbll_header (20 B): u32 magic=0x7573626c 'usbl', u32 version=1, u32 txid, u32 rxid, u32 command
@@ -387,7 +387,7 @@ No configuration files and no environment variables are read on the host (`geten
 | P10 | getopt diagnostics | glibc text with `argv[0]` | BSD text with basename | as in the client port |
 | P11 | `-lrt`, `-fcommon` | ok / D26 | no `librt` | reference-build only |
 | P12 | `fork` after threads | `-c` thread lost (D6) | same; also libusb-1.0 on macOS starts a CoreFoundation thread at init [H], but init happens after fork | |
-| P13 | Byte order / layout | all structs native-endian, packed by natural alignment (sizes 20/60/28/12/12/48/16) | same | Rust: explicit LE codecs, size assertions |
+| P13 | Byte order / layout | all structs native-endian, packed by natural alignment (sizes 20/60/28/12/12/48/16) | same | Rust: host-native codecs as C (little-endian on all supported hosts), fixed sizes |
 
 ## 6. Suspected bugs (flagged, not fixed)
 
@@ -426,6 +426,7 @@ No configuration files and no environment variables are read on the host (`geten
 | D31 | `main.c:1039-1041` | Std fds closed, not reopened | Console logs go to whatever owns fds 1/2 (listen sockets, so `send` fails) [H harmless] |
 | D32 | `main.c:252` | `sc->channel > 0` true for `(uint32_t)-1` | `close_channel(0xffffffff)` on failed sockets (returns −1, harmless) |
 | D33 | `main.c:1243-1246` | Device chosen by nduid **prefix** of the URL path; empty path → first device | Commands may hit the wrong device if ids differ in length (inet peers) |
+| D34 | `transport_usb.c:574,636-638,447-454,675` | A SYN shorter than `offsetof(usbll_syn_header, mtu)` establishes the link but never calls `novacom_go_online` (`/* TODO: handle this case */`), so `device_handle` stays NULL | The next DATA packet in either direction passes a NULL device to the mux: crash. Found during the port; intentionally changed: rx DATA is dropped and no DATA is sent |
 
 Unsafe or nondeterministic defects are candidates for "intentionally changed" (as decided for the client port); deterministic quirks (NUL-terminated replies, no `ok` for `list`, prefix matching, 999 ms heartbeat, odd-length padding rule, timestamps) are preserved. Decided in Q2 and Q5 (Section 10).
 

@@ -2,7 +2,8 @@
 
 A Rust port of [novacomd](https://github.com/openwebos/novacomd), the host daemon that connects webOS devices (such as the Palm Pre3) over USB or TCP to novacom clients. rovacomd keeps the C daemon's command line, ports, log output and wire protocol, works with both `novacom` and [`rovacom`](https://github.com/jauderho/rovacom), and also runs under the name `novacomd`. Linux and macOS are both supported.
 
-- [Assessment of the C original](docs/ASSESSMENT.md): behavior, divergences (D1-D33) and decisions (Q1-Q7)
+- [Assessment of the C original](docs/ASSESSMENT.md): behavior, divergences (D1-D34) and decisions (Q1-Q7)
+- [Status and verification report](docs/STATUS.md)
 
 Licensed under Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
